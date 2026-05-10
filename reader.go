@@ -213,6 +213,59 @@ func OpenReader(opts ReaderOptions) (*Reader, error) {
 	return r, nil
 }
 
+// HeadIndex returns the highest record index currently on disk in the WAL,
+// regardless of whether the reader has consumed it. Cheap (one glob).
+//
+// For closed segments it uses the LastIndex encoded in the filename. For an
+// open segment it scans the file tail with CRC validation — that read is O(N)
+// in the open segment's size, so don't call this in tight loops if you have
+// huge open segments. Use Lag() for the typical metric.
+func (r *Reader) HeadIndex() (uint64, error) {
+	return r.scanLastIndex()
+}
+
+// Lag returns how many records and bytes are between the reader's last Ack and
+// the current head of the WAL.
+//
+// records = HeadIndex() - CurrentIndex(). When the cursor is current, returns 0.
+// bytes is the on-disk size of all closed segments whose LastIndex > cursor,
+// plus the full size of the open segment if any. It overestimates slightly
+// (counts framing overhead) but is good enough for "consumer is falling behind"
+// alerts.
+func (r *Reader) Lag() (records uint64, bytes int64, err error) {
+	cursor := r.cur.CurrentIndex()
+	head, err := r.scanLastIndex()
+	if err != nil {
+		return 0, 0, err
+	}
+	if head > cursor {
+		records = head - cursor
+	}
+
+	segs, err := r.listSegments()
+	if err != nil {
+		return records, 0, err
+	}
+	for _, s := range segs {
+		path := filepath.Join(r.dir, s.Name)
+		fi, statErr := os.Stat(path)
+		if statErr != nil {
+			continue
+		}
+		if s.Closed {
+			// Include the segment if any of its records are unread.
+			if s.LastIndex > cursor {
+				bytes += fi.Size()
+			}
+		} else {
+			// Open segment: always counted toward lag (we don't know exactly how
+			// many of its bytes are past the cursor without re-walking it).
+			bytes += fi.Size()
+		}
+	}
+	return records, bytes, nil
+}
+
 // Stats returns a thread-safe snapshot of reader counters and gauges.
 func (r *Reader) Stats() ReaderStats {
 	return ReaderStats{

@@ -76,7 +76,15 @@ func (w *Writer) runRetention() error {
 	if retainFloor < cutoff {
 		cutoff = retainFloor
 	}
-	if cutoff == 0 {
+
+	// MaxRetainAge: any segment older than this is also eligible for deletion,
+	// regardless of cursors. Computed once per pass.
+	var ageDeadline time.Time
+	if w.opts.Retention.MaxRetainAge > 0 {
+		ageDeadline = time.Now().Add(-w.opts.Retention.MaxRetainAge)
+	}
+
+	if cutoff == 0 && ageDeadline.IsZero() {
 		return nil
 	}
 
@@ -88,6 +96,7 @@ func (w *Writer) runRetention() error {
 	type item struct {
 		path string
 		seg  segName
+		mod  time.Time
 	}
 	var items []item
 	for _, p := range matches {
@@ -102,19 +111,32 @@ func (w *Writer) runRetention() error {
 		if p == curPath {
 			continue
 		}
-		items = append(items, item{p, s})
+		fi, statErr := os.Stat(p)
+		if statErr != nil {
+			continue
+		}
+		items = append(items, item{p, s, fi.ModTime()})
 	}
 	sort.Slice(items, func(i, j int) bool { return items[i].seg.LastIndex < items[j].seg.LastIndex })
 
 	for _, it := range items {
-		// We treat "<= cutoff-1" as deletable: a segment with LastIndex == cutoff
-		// still contains the record at index `cutoff` itself, which a reader at
-		// position `cutoff` (next-to-read) might want.
-		if it.seg.LastIndex >= cutoff {
-			break
+		// Two independent reasons to delete this segment:
+		//   1. cursor/MinRetainRecords cutoff has moved past it
+		//   2. MaxRetainAge fires (compliance-style hard purge)
+		eligibleByCursor := cutoff > 0 && it.seg.LastIndex < cutoff
+		eligibleByAge := !ageDeadline.IsZero() && it.mod.Before(ageDeadline)
+		if !eligibleByCursor && !eligibleByAge {
+			// Cursor list is sorted ascending, so once we hit a non-cursor-
+			// eligible segment we can stop — but only if AGE retention isn't
+			// also active, since the age check is independent of order.
+			if ageDeadline.IsZero() {
+				break
+			}
+			continue
 		}
 		// Archive gate: if configured, only delete once an external uploader
-		// has marked this segment as archived.
+		// has marked this segment as archived. Applies regardless of WHY the
+		// segment is eligible.
 		if w.opts.Retention.RequireArchivedMark && !isArchived(w.dir, it.seg) {
 			continue
 		}
@@ -122,11 +144,17 @@ func (w *Writer) runRetention() error {
 			w.log.Error("retention: remove failed", "name", it.seg.Name, "err", err)
 			continue
 		}
-		// Clean up the sidecar if it existed.
 		_ = removeArchivedSidecar(w.dir, it.seg)
 		w.cnt.retentionDeletes.Add(1)
+		reason := "cursor"
+		if eligibleByAge && !eligibleByCursor {
+			reason = "age"
+		} else if eligibleByAge {
+			reason = "cursor+age"
+		}
 		w.log.Info("retention: deleted segment",
-			"name", it.seg.Name, "last_index", it.seg.LastIndex, "cutoff", cutoff)
+			"name", it.seg.Name, "last_index", it.seg.LastIndex,
+			"cutoff", cutoff, "age", time.Since(it.mod), "reason", reason)
 	}
 	return fsyncDir(w.dir)
 }

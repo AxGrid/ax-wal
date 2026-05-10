@@ -158,6 +158,19 @@ type RetentionConfig struct {
 	// Mark a segment as archived from the writer process via Writer.MarkArchived,
 	// or externally with `axwal-cli mark-archived <segment>`.
 	RequireArchivedMark bool
+
+	// MaxRetainAge, when > 0, force-deletes closed segments whose ModTime is
+	// older than this duration — independent of cursor positions and
+	// MinRetainRecords. Use for compliance-style "purge after N days".
+	//
+	// CAUTION: this can delete data that no reader has consumed. Pair with a
+	// matching consumer SLO (e.g. "all consumers must drain within 6 days" if
+	// MaxRetainAge=7d), or readers with lagging cursors will get fast-forwarded
+	// and lose records.
+	//
+	// RequireArchivedMark still applies — even time-aged segments wait for the
+	// sidecar before deletion.
+	MaxRetainAge time.Duration
 }
 
 // WriterStats is a thread-safe snapshot of writer counters/gauges. Cheap to
@@ -360,22 +373,41 @@ func (w *Writer) NextIndex() uint64 {
 	return w.lastIndex + 1
 }
 
-// Append writes a single record and fsyncs.
+// Append writes a single record and fsyncs. Equivalent to
+// AppendContext(context.Background(), payload).
 func (w *Writer) Append(payload []byte) (uint64, error) {
-	idxs, err := w.AppendBatch([][]byte{payload})
+	return w.AppendContext(context.Background(), payload)
+}
+
+// AppendContext writes a single record and waits for durability, respecting
+// ctx cancellation while waiting on the group-commit window. Returns
+// ctx.Err() if the deadline elapses before the batch is fsynced.
+func (w *Writer) AppendContext(ctx context.Context, payload []byte) (uint64, error) {
+	idxs, err := w.AppendBatchContext(ctx, [][]byte{payload})
 	if err != nil {
 		return 0, err
 	}
 	return idxs[0], nil
 }
 
-// AppendBatch writes multiple records atomically and returns the assigned
-// indices in order. By default each call ends with an fsync; with GroupCommit
-// enabled the fsync is shared across concurrent appenders, but each call still
-// blocks until its records are durable.
+// AppendBatch writes multiple records atomically. Equivalent to
+// AppendBatchContext(context.Background(), records).
 func (w *Writer) AppendBatch(records [][]byte) ([]uint64, error) {
+	return w.AppendBatchContext(context.Background(), records)
+}
+
+// AppendBatchContext writes multiple records atomically and returns the
+// assigned indices. By default each call ends with an fsync; with GroupCommit
+// enabled the fsync is shared across concurrent appenders, but each call still
+// blocks until its records are durable. ctx cancellation aborts the group-
+// commit wait (the records may still be on disk after the next commit window
+// — but the caller is told nothing about whether they were committed).
+func (w *Writer) AppendBatchContext(ctx context.Context, records [][]byte) ([]uint64, error) {
 	if len(records) == 0 {
 		return nil, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 
 	w.mu.Lock()
@@ -433,12 +465,43 @@ func (w *Writer) AppendBatch(records [][]byte) ([]uint64, error) {
 		if w.pendingBytes >= w.opts.GroupCommit.MaxBatchBytes {
 			w.kickCommit()
 		}
-		// Wait until our batch is durable.
-		for w.commitIndex < myMaxIdx && !w.closed {
+
+		// ctx-aware wait: if the caller's ctx is cancellable, spawn a watcher
+		// that broadcasts on the cond so the Wait() unblocks.
+		var stopWatch chan struct{}
+		if ctx.Done() != nil {
+			stopWatch = make(chan struct{})
+			go func() {
+				select {
+				case <-ctx.Done():
+					w.mu.Lock()
+					w.gcCond.Broadcast()
+					w.mu.Unlock()
+				case <-stopWatch:
+				}
+			}()
+		}
+
+		for {
+			if w.closed {
+				if stopWatch != nil {
+					close(stopWatch)
+				}
+				return nil, errors.New("axwal: writer closed during commit")
+			}
+			if err := ctx.Err(); err != nil {
+				if stopWatch != nil {
+					close(stopWatch)
+				}
+				return nil, err
+			}
+			if w.commitIndex >= myMaxIdx {
+				break
+			}
 			w.gcCond.Wait()
 		}
-		if w.closed {
-			return nil, errors.New("axwal: writer closed during commit")
+		if stopWatch != nil {
+			close(stopWatch)
 		}
 		return idxs, nil
 	}

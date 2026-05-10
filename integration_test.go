@@ -643,6 +643,116 @@ func TestBackpressure(t *testing.T) {
 	require.GreaterOrEqual(t, w2.Stats().BackpressureRejects, uint64(1))
 }
 
+func TestRetention_MaxRetainAge(t *testing.T) {
+	dir := t.TempDir()
+	// MinRetainRecords much higher than what we'll write — disables the
+	// cursor-driven cutoff so we exclusively test the age path.
+	w, err := OpenWriter(WriterOptions{
+		Dir:            dir,
+		MaxSegmentSize: 64,
+		Retention: RetentionConfig{
+			Enabled:          true,
+			Interval:         50 * time.Millisecond,
+			MaxRetainAge:     200 * time.Millisecond,
+			MinRetainRecords: 1000,
+			StaleReaderTTL:   5 * time.Second,
+		},
+	})
+	require.NoError(t, err)
+	defer w.Close()
+
+	// Write 30 records — produces several closed segments.
+	for i := 0; i < 30; i++ {
+		_, err := w.Append([]byte(fmt.Sprintf("v%d", i)))
+		require.NoError(t, err)
+	}
+	w.awaitRotations()
+
+	// All segments should be brand-new and survive the first scan.
+	require.Eventually(t, func() bool {
+		segs := closedSegments(t, dir)
+		return len(segs) >= 2 // we know there should be multiple
+	}, 1*time.Second, 50*time.Millisecond)
+
+	// Wait long enough for the age threshold to fire on segments closed early.
+	time.Sleep(500 * time.Millisecond)
+
+	// All segments older than 200ms must now be gone — only the most recent
+	// (still-young) closed segment, if any, remains. The current open segment
+	// is never touched.
+	require.Eventually(t, func() bool {
+		segs := closedSegments(t, dir)
+		return len(segs) <= 1
+	}, 1*time.Second, 50*time.Millisecond, "age-based retention should have purged old closed segments")
+}
+
+func TestReader_Lag(t *testing.T) {
+	dir := t.TempDir()
+	w, err := OpenWriter(WriterOptions{Dir: dir, MaxSegmentSize: 1 << 20})
+	require.NoError(t, err)
+	defer w.Close()
+
+	for i := 0; i < 10; i++ {
+		_, err := w.Append([]byte("payload-payload"))
+		require.NoError(t, err)
+	}
+
+	r, err := OpenReader(ReaderOptions{Dir: dir, Name: "lag", StartFrom: StartEarliest})
+	require.NoError(t, err)
+	defer r.Close()
+
+	// Before any Ack, lag = 10 records.
+	rec, bytes, err := r.Lag()
+	require.NoError(t, err)
+	require.Equal(t, uint64(10), rec)
+	require.Greater(t, bytes, int64(0))
+
+	// Drain 7 records.
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	for i := 0; i < 7; i++ {
+		_, idx, err := r.Next(ctx)
+		require.NoError(t, err)
+		require.NoError(t, r.Ack(idx))
+	}
+
+	rec, _, err = r.Lag()
+	require.NoError(t, err)
+	require.Equal(t, uint64(3), rec)
+}
+
+func TestAppendContext_CanceledMidWait(t *testing.T) {
+	dir := t.TempDir()
+	w, err := OpenWriter(WriterOptions{
+		Dir: dir,
+		GroupCommit: GroupCommitConfig{
+			Enabled: true,
+			// Long latency so we control when the commit happens.
+			MaxLatency: time.Hour,
+		},
+	})
+	require.NoError(t, err)
+	defer w.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := w.AppendContext(ctx, []byte("blocked"))
+		done <- err
+	}()
+
+	// Give the goroutine time to enter the cond.Wait.
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+
+	select {
+	case err := <-done:
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(2 * time.Second):
+		t.Fatal("AppendContext did not return after ctx cancel")
+	}
+}
+
 func TestRotation_ByAge(t *testing.T) {
 	dir := t.TempDir()
 	w, err := OpenWriter(WriterOptions{
