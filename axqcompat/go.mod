@@ -3,7 +3,7 @@ module github.com/axgrid/ax-wal/axqcompat
 go 1.23
 
 require (
-	github.com/axgrid/ax-wal v0.0.0-00010101000000-000000000000
+	github.com/axgrid/ax-wal v0.1.0
 	github.com/axgrid/axq v0.6.5
 	github.com/golang/protobuf v1.5.4
 )
@@ -33,5 +33,9 @@ require (
 	gorm.io/gorm v1.25.7 // indirect
 )
 
-// Use the sibling working tree until ax-wal is published.
+// Local-dev convenience: when this module is the main module (i.e. you're
+// hacking on axqcompat itself), the sibling ax-wal source tree is used in
+// place of the tagged release. External consumers (`go get
+// github.com/axgrid/ax-wal/axqcompat@v0.1.0` from elsewhere) ignore this
+// replace and get the pinned `require` version above.
 replace github.com/axgrid/ax-wal => ../
