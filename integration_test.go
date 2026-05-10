@@ -643,6 +643,116 @@ func TestBackpressure(t *testing.T) {
 	require.GreaterOrEqual(t, w2.Stats().BackpressureRejects, uint64(1))
 }
 
+func TestOnRotate_AndMetaSidecar(t *testing.T) {
+	dir := t.TempDir()
+	type rotEvent struct {
+		first, last uint64
+		path        string
+		size        int64
+		compressed  bool
+	}
+	var (
+		mu     sync.Mutex
+		events []rotEvent
+	)
+	w, err := OpenWriter(WriterOptions{
+		Dir:              dir,
+		MaxSegmentSize:   100,
+		WriteMetaSidecar: true,
+		OnRotate: func(s SegmentInfo) {
+			mu.Lock()
+			events = append(events, rotEvent{s.FirstIndex, s.LastIndex, s.Path, s.SizeBytes, s.Compressed})
+			mu.Unlock()
+		},
+	})
+	require.NoError(t, err)
+
+	for i := 0; i < 30; i++ {
+		_, err := w.Append([]byte(fmt.Sprintf("xxxx-%02d", i)))
+		require.NoError(t, err)
+	}
+	w.awaitRotations()
+	require.NoError(t, w.Close())
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.GreaterOrEqual(t, len(events), 2, "expected multiple rotation events; got %v", events)
+
+	// Each event must reference an existing file with the right indices.
+	for _, e := range events {
+		require.GreaterOrEqual(t, e.last, e.first)
+		_, err := os.Stat(e.path)
+		require.NoError(t, err, "OnRotate path must exist: %s", e.path)
+		// .meta sidecar must exist for each rotated segment.
+		meta, err := readMetaSidecar(dir, e.first, e.last)
+		require.NoError(t, err)
+		require.NotNil(t, meta, "missing .meta for %d-%d", e.first, e.last)
+		require.Equal(t, e.first, meta.FirstIndex)
+		require.Equal(t, e.last, meta.LastIndex)
+		require.Equal(t, e.last-e.first+1, meta.NumRecords)
+		require.Greater(t, meta.NumBytesUncompressed, int64(0))
+		require.Len(t, meta.SHA256Uncompressed, 64)
+	}
+}
+
+func TestOnRotate_PanicRecovered(t *testing.T) {
+	dir := t.TempDir()
+	w, err := OpenWriter(WriterOptions{
+		Dir:            dir,
+		MaxSegmentSize: 100,
+		OnRotate: func(s SegmentInfo) {
+			panic("boom")
+		},
+	})
+	require.NoError(t, err)
+
+	for i := 0; i < 30; i++ {
+		_, err := w.Append([]byte("xxxxxxxxxx"))
+		require.NoError(t, err)
+	}
+	w.awaitRotations()
+	require.NoError(t, w.Close()) // must NOT block or fail despite panicking callback
+}
+
+func TestTruncatePrefix(t *testing.T) {
+	dir := t.TempDir()
+	w, err := OpenWriter(WriterOptions{
+		Dir:              dir,
+		MaxSegmentSize:   100,
+		WriteMetaSidecar: true,
+	})
+	require.NoError(t, err)
+	for i := 0; i < 30; i++ {
+		_, err := w.Append([]byte("xxxxxxxxxx"))
+		require.NoError(t, err)
+	}
+	w.awaitRotations()
+
+	before := closedSegments(t, dir)
+	require.Greater(t, len(before), 1)
+
+	// Truncate everything below index 15.
+	removed, err := w.TruncatePrefix(15)
+	require.NoError(t, err)
+	require.Greater(t, removed, 0)
+
+	after := closedSegments(t, dir)
+	require.Less(t, len(after), len(before))
+	for _, s := range after {
+		require.GreaterOrEqual(t, s.LastIndex, uint64(15))
+	}
+
+	// Meta sidecars for removed ranges must also be gone.
+	for _, s := range before {
+		if s.LastIndex < 15 {
+			meta, err := readMetaSidecar(dir, s.FirstIndex, s.LastIndex)
+			require.NoError(t, err)
+			require.Nil(t, meta, "stale meta for truncated %s", s.Name)
+		}
+	}
+	require.NoError(t, w.Close())
+}
+
 func TestRetention_MaxRetainAge(t *testing.T) {
 	dir := t.TempDir()
 	// MinRetainRecords much higher than what we'll write — disables the

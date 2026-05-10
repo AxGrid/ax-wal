@@ -40,18 +40,58 @@ func (w *Writer) finalizeRotated(openPath string, first, last uint64) {
 		return
 	}
 
-	if !w.opts.CompressOnRotate {
-		return
-	}
-	zstPath := finalPath + ".zst"
-	if err := robustCompressZstd(w.ctx, w.log, finalPath, zstPath); err != nil {
-		if errors.Is(err, context.Canceled) {
-			w.log.Warn("compression abandoned (writer closing)",
-				"src", filepath.Base(finalPath))
-			return
+	finalLivePath := finalPath
+	compressedFlag := false
+
+	if w.opts.CompressOnRotate {
+		zstPath := finalPath + ".zst"
+		if err := robustCompressZstd(w.ctx, w.log, finalPath, zstPath); err != nil {
+			if errors.Is(err, context.Canceled) {
+				w.log.Warn("compression abandoned (writer closing)",
+					"src", filepath.Base(finalPath))
+				return
+			}
+			w.log.Error("zstd compress failed (leaving uncompressed)",
+				"src", filepath.Base(finalPath), "dst", filepath.Base(zstPath), "err", err)
+		} else {
+			finalLivePath = zstPath
+			compressedFlag = true
 		}
-		w.log.Error("zstd compress failed (leaving uncompressed)",
-			"src", filepath.Base(finalPath), "dst", filepath.Base(zstPath), "err", err)
+	}
+
+	// Optional .meta sidecar — written before the user callback so the callback
+	// can read it (e.g., to upload metadata alongside the segment).
+	if w.opts.WriteMetaSidecar {
+		if err := writeMetaSidecar(w.dir, finalPath, first, last); err != nil {
+			w.log.Error("meta sidecar write failed", "name", filepath.Base(finalPath), "err", err)
+		}
+	}
+
+	if w.opts.OnRotate != nil {
+		fi, statErr := os.Stat(finalLivePath)
+		var size int64
+		if statErr == nil {
+			size = fi.Size()
+		}
+		info := SegmentInfo{
+			Path:       finalLivePath,
+			FirstIndex: first,
+			LastIndex:  last,
+			SizeBytes:  size,
+			Compressed: compressedFlag,
+		}
+		// Recover from panics so a buggy user callback can't tear down the
+		// writer. We DON'T recover from cancellation — a hung callback at
+		// shutdown is the user's problem (we already log via CloseTimeout).
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					w.log.Error("OnRotate callback panicked",
+						"segment", filepath.Base(finalLivePath), "panic", fmt.Sprintf("%v", r))
+				}
+			}()
+			w.opts.OnRotate(info)
+		}()
 	}
 }
 

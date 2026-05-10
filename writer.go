@@ -45,6 +45,23 @@ type WriterOptions struct {
 	// CompressOnRotate toggles async zstd compression of rotated segments.
 	CompressOnRotate bool
 
+	// OnRotate, if non-nil, is invoked from a background goroutine after a
+	// segment is successfully renamed to its closed form (and compressed, if
+	// enabled). Use it for in-process archiving — uploading to S3, triggering
+	// replication, computing checksums. Panics inside the callback are
+	// recovered and logged so they can't take down the writer.
+	//
+	// The callback runs serially per segment; do your own concurrency if you
+	// want parallel uploads. Slow callbacks back-pressure rotateWG.Wait at
+	// Close time, so consider running the heavy work on your own goroutine
+	// and just enqueuing here.
+	OnRotate func(SegmentInfo)
+
+	// WriteMetaSidecar toggles writing wal-F-L.meta after rotation. The meta
+	// JSON includes record counts, byte size, and a sha256 of the uncompressed
+	// content — useful for backup verification and time-based retention.
+	WriteMetaSidecar bool
+
 	// SyncMode selects the durability strategy on each commit window. See
 	// SyncMode constants for the trade-offs. Defaults to SyncFull.
 	SyncMode SyncMode
@@ -76,6 +93,25 @@ type WriterOptions struct {
 
 	// Retention controls cursor-aware automatic deletion of old segments.
 	Retention RetentionConfig
+}
+
+// SegmentInfo describes a closed segment delivered to the OnRotate callback
+// and used by helper APIs (axwal-cli, archive workflows).
+type SegmentInfo struct {
+	// Path is the absolute path of the segment file as it exists right now.
+	// For a freshly-rotated uncompressed segment this is /…/wal-F-L; if
+	// compression is enabled and finished, it's /…/wal-F-L.zst.
+	Path string
+
+	// FirstIndex / LastIndex are the closed-form bounds (inclusive).
+	FirstIndex uint64
+	LastIndex  uint64
+
+	// SizeBytes is the on-disk size at the moment the callback fires.
+	SizeBytes int64
+
+	// Compressed reports whether Path ends in ".zst".
+	Compressed bool
 }
 
 // SyncMode controls how aggressively the writer pushes data to stable storage.
@@ -740,6 +776,63 @@ func (w *Writer) Close() error {
 		firstErr = ErrCloseTimeout
 	}
 	return firstErr
+}
+
+// TruncatePrefix synchronously deletes all closed segments whose LastIndex is
+// strictly below uptoIndex, plus their .archived/.meta sidecars. The active
+// open segment is never touched.
+//
+// Use this for explicit checkpoint-style truncation: "I've persisted everything
+// up to N elsewhere; drop the local prefix." It bypasses cursor protection and
+// MinRetainRecords, so call it only when you know no consumer will need the
+// truncated range again. Live readers whose cursors fall below the new
+// earliest-available will be fast-forwarded on their next OpenReader.
+//
+// Returns the number of segments removed.
+func (w *Writer) TruncatePrefix(uptoIndex uint64) (int, error) {
+	w.mu.Lock()
+	if w.closed {
+		w.mu.Unlock()
+		return 0, errors.New("axwal: writer closed")
+	}
+	curPath := w.curPath
+	w.mu.Unlock()
+
+	matches, err := filepath.Glob(filepath.Join(w.dir, "wal-*"))
+	if err != nil {
+		return 0, err
+	}
+	removed := 0
+	for _, p := range matches {
+		base := filepath.Base(p)
+		if base == writerLockFile {
+			continue
+		}
+		s, err := parseSegName(base)
+		if err != nil || !s.Closed {
+			continue
+		}
+		if p == curPath {
+			continue
+		}
+		if s.LastIndex >= uptoIndex {
+			continue
+		}
+		if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
+			w.log.Error("truncate-prefix: remove failed", "name", base, "err", err)
+			continue
+		}
+		_ = removeArchivedSidecar(w.dir, s)
+		_ = removeMetaSidecar(w.dir, s.FirstIndex, s.LastIndex)
+		w.cnt.retentionDeletes.Add(1)
+		w.log.Info("truncate-prefix: deleted segment",
+			"name", base, "last_index", s.LastIndex, "upto", uptoIndex)
+		removed++
+	}
+	if err := fsyncDir(w.dir); err != nil {
+		return removed, err
+	}
+	return removed, nil
 }
 
 // Sync forces a full fsync of the current segment file. Use this as an

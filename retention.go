@@ -145,6 +145,7 @@ func (w *Writer) runRetention() error {
 			continue
 		}
 		_ = removeArchivedSidecar(w.dir, it.seg)
+		_ = removeMetaSidecar(w.dir, it.seg.FirstIndex, it.seg.LastIndex)
 		w.cnt.retentionDeletes.Add(1)
 		reason := "cursor"
 		if eligibleByAge && !eligibleByCursor {
