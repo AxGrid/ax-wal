@@ -523,6 +523,18 @@ func (w *Writer) rotateLocked() error {
 		return w.openNewSegment()
 	}
 
+	// Rotating an empty segment is a no-op. If we did rotate it, we'd spawn an
+	// async rename of "wal-F-" -> "wal-F-(F-1)" (the empty marker) while
+	// openNewSegment immediately recreates a new file at "wal-F-" — same path
+	// because firstIndex = lastIndex+1 = F. The two operations race for the
+	// directory entry and can corrupt subsequent appends. Skipping the rotate
+	// here is the only safe behavior; callers calling Rotate() on an empty
+	// segment expressed an intent that is satisfied by "the segment will roll
+	// once you actually write to it".
+	if w.curRecords == 0 {
+		return nil
+	}
+
 	if err := w.flushAndSyncLocked(); err != nil {
 		return err
 	}
