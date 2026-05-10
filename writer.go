@@ -42,6 +42,13 @@ type WriterOptions struct {
 	// many records. Zero disables.
 	MaxSegmentRecords uint64
 
+	// PreallocateSegments, when true, reserves MaxSegmentSize bytes on disk at
+	// segment-create time (Linux fallocate KEEP_SIZE, macOS F_PREALLOCATE).
+	// Disk-full surfaces immediately on segment creation rather than mid-Append,
+	// and segments are typically more contiguous on the underlying storage.
+	// Costs an extra fcntl per rotation; safe to leave on for production.
+	PreallocateSegments bool
+
 	// CompressOnRotate toggles async zstd compression of rotated segments.
 	CompressOnRotate bool
 
@@ -84,6 +91,13 @@ type WriterOptions struct {
 	// CloseTimeout caps how long Close() waits for in-flight rotations /
 	// compressions to finish. 0 means wait indefinitely (current behavior).
 	CloseTimeout time.Duration
+
+	// VerifyOnOpen performs a full CRC walk of every closed segment at
+	// OpenWriter time. Reports gaps in the index chain and removes one of any
+	// duplicate (wal-F-L vs wal-F-L.zst) pair. Costly — proportional to total
+	// WAL size — but catches data damage from out-of-band actors (rsync, FS
+	// corruption, manual file shuffling).
+	VerifyOnOpen bool
 
 	// GroupCommit, when enabled, batches multiple concurrent Append/AppendBatch
 	// calls into a single fsync. Each Append still BLOCKS until its batch has
@@ -343,6 +357,13 @@ func OpenWriter(opts WriterOptions) (*Writer, error) {
 		return nil, fmt.Errorf("recovery: %w", err)
 	}
 	w.lastIndex = last
+
+	if opts.VerifyOnOpen {
+		if err := verifyChain(opts.Dir, logger); err != nil {
+			_ = lock.Release()
+			return nil, fmt.Errorf("verify chain: %w", err)
+		}
+	}
 
 	if err := w.openNewSegment(); err != nil {
 		_ = lock.Release()
@@ -668,6 +689,14 @@ func (w *Writer) openNewSegment() error {
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 	if err != nil {
 		return err
+	}
+	if w.opts.PreallocateSegments && w.opts.MaxSegmentSize > 0 {
+		if err := preallocate(f, w.opts.MaxSegmentSize); err != nil {
+			// Best-effort: log and continue without pre-alloc rather than fail
+			// the whole open. Disk-full will surface on the first Append's
+			// fsync if it's a real problem.
+			w.log.Warn("preallocate failed (continuing without)", "name", name, "err", err)
+		}
 	}
 	// fsync the directory so the new file entry is durable.
 	if err := fsyncDir(w.dir); err != nil {

@@ -14,3 +14,16 @@ import (
 func syncBarrier(f *os.File) error {
 	return syscall.Fdatasync(int(f.Fd()))
 }
+
+// preallocate uses fallocate(2) to reserve space. Mode 0 actually allocates
+// (not FALLOC_FL_KEEP_SIZE) so the file size grows; subsequent O_APPEND writes
+// land at the actual data tail thanks to ftruncate-on-Close-if-needed elsewhere.
+// Actually we DO want KEEP_SIZE here because we want disk reservation without
+// changing the logical EOF (so bufio's append still works correctly).
+func preallocate(f *os.File, length int64) error {
+	if length <= 0 {
+		return nil
+	}
+	const fallocKeepSize = 0x01 // FALLOC_FL_KEEP_SIZE
+	return syscall.Fallocate(int(f.Fd()), fallocKeepSize, 0, length)
+}

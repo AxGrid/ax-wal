@@ -199,3 +199,160 @@ func base(p string) string { return filepath.Base(p) }
 // _ keeps zstd referenced so go vet doesn't complain on the unused-import path
 // when CompressOnRotate is false. Import is needed by recovery's compress branch.
 var _ = zstd.SpeedDefault
+
+// verifyChain CRC-walks every closed segment, dedupes (wal-F-L vs
+// wal-F-L.zst) pairs, and reports gaps in the index chain. Called at
+// OpenWriter time when WriterOptions.VerifyOnOpen is set.
+//
+// Side effects: when both compressed and uncompressed forms of the same
+// segment exist, removes the uncompressed twin. Also removes any segment
+// that fails CRC (callers should rely on cluster-level redundancy or backups
+// to recover from CRC corruption — keeping a known-bad segment in the chain
+// would silently break readers).
+//
+// Returns nil even when gaps are detected — the caller already lost that data
+// so failing the open would just make recovery harder. Gaps are surfaced via
+// log warnings.
+func verifyChain(dir string, log *slog.Logger) error {
+	matches, err := filepath.Glob(filepath.Join(dir, "wal-*"))
+	if err != nil {
+		return err
+	}
+
+	// Group by (FirstIndex, LastIndex). When two entries share the range, one
+	// is uncompressed and one is .zst — we keep the .zst.
+	type key struct{ first, last uint64 }
+	type cand struct {
+		path    string
+		seg     segName
+	}
+	groups := map[key][]cand{}
+	for _, p := range matches {
+		base := filepath.Base(p)
+		s, err := parseSegName(base)
+		if err != nil || !s.Closed {
+			continue
+		}
+		k := key{s.FirstIndex, s.LastIndex}
+		groups[k] = append(groups[k], cand{p, s})
+	}
+
+	// Resolve duplicates.
+	for k, cs := range groups {
+		if len(cs) <= 1 {
+			continue
+		}
+		// Prefer .zst. If both are .zst (impossible by parser) or both raw,
+		// keep the larger one.
+		var keepIdx int = -1
+		for i, c := range cs {
+			if c.seg.Compression == "zst" {
+				keepIdx = i
+				break
+			}
+		}
+		if keepIdx == -1 {
+			keepIdx = 0
+		}
+		for i, c := range cs {
+			if i == keepIdx {
+				continue
+			}
+			log.Warn("verify: duplicate range; removing twin",
+				"keeping", filepath.Base(cs[keepIdx].path),
+				"removing", filepath.Base(c.path),
+				"first", k.first, "last", k.last)
+			if err := os.Remove(c.path); err != nil && !errors.Is(err, os.ErrNotExist) {
+				log.Error("verify: remove twin failed", "path", c.path, "err", err)
+			}
+		}
+	}
+
+	// Re-scan after dedup for chain analysis.
+	matches, err = filepath.Glob(filepath.Join(dir, "wal-*"))
+	if err != nil {
+		return err
+	}
+	var closed []segName
+	for _, p := range matches {
+		base := filepath.Base(p)
+		s, err := parseSegName(base)
+		if err != nil || !s.Closed {
+			continue
+		}
+		closed = append(closed, s)
+	}
+	sort.Slice(closed, func(i, j int) bool { return closed[i].FirstIndex < closed[j].FirstIndex })
+
+	// CRC walk.
+	for _, s := range closed {
+		path := filepath.Join(dir, s.Name)
+		got, err := walkAndCount(path)
+		if err != nil {
+			log.Error("verify: segment failed CRC walk; removing",
+				"name", s.Name, "records_seen", got, "err", err)
+			if rmErr := os.Remove(path); rmErr != nil {
+				log.Error("verify: remove failed segment", "name", s.Name, "err", rmErr)
+			}
+			continue
+		}
+		expected := s.LastIndex - s.FirstIndex + 1
+		if uint64(got) != expected {
+			log.Warn("verify: record count mismatch",
+				"name", s.Name, "expected", expected, "got", got)
+		}
+	}
+
+	// Gap detection.
+	var prev uint64 // last LastIndex seen
+	first := true
+	for _, s := range closed {
+		// Skip the segment if it was removed by CRC walk.
+		if _, statErr := os.Stat(filepath.Join(dir, s.Name)); statErr != nil {
+			continue
+		}
+		if first {
+			if s.FirstIndex != 1 {
+				log.Warn("verify: chain doesn't start at 1", "first_segment", s.Name, "first_index", s.FirstIndex)
+			}
+			first = false
+		} else if s.FirstIndex != prev+1 {
+			log.Warn("verify: gap detected",
+				"missing_range", fmt.Sprintf("%d..%d", prev+1, s.FirstIndex-1),
+				"prev_segment_last", prev, "next_segment_first", s.FirstIndex)
+		}
+		prev = s.LastIndex
+	}
+	return nil
+}
+
+// walkAndCount opens path (transparent .zst) and counts CRC-valid records.
+// Returns count, with error on any frame failure.
+func walkAndCount(path string) (int, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+	var src io.Reader = f
+	if filepath.Ext(path) == ".zst" {
+		dec, derr := zstd.NewReader(f)
+		if derr != nil {
+			return 0, derr
+		}
+		defer dec.Close()
+		src = dec
+	}
+	br := bufio.NewReaderSize(src, 64*1024)
+	count := 0
+	for {
+		_, err := readRecord(br)
+		if err == io.EOF {
+			return count, nil
+		}
+		if err != nil {
+			return count, err
+		}
+		count++
+	}
+}

@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -794,6 +795,106 @@ func TestRetention_MaxRetainAge(t *testing.T) {
 		segs := closedSegments(t, dir)
 		return len(segs) <= 1
 	}, 1*time.Second, 50*time.Millisecond, "age-based retention should have purged old closed segments")
+}
+
+func TestPreallocateSegments(t *testing.T) {
+	dir := t.TempDir()
+	const segSize = 1 << 20 // 1 MiB
+	w, err := OpenWriter(WriterOptions{
+		Dir:                 dir,
+		MaxSegmentSize:      segSize,
+		PreallocateSegments: true,
+	})
+	require.NoError(t, err)
+
+	// Single small append. Without preallocation the segment file would be
+	// only ~20 bytes; with it, the OS reserved at least segSize bytes (Linux
+	// fallocate KEEP_SIZE counts the disk usage, while macOS F_PREALLOCATE
+	// also reserves; observe via either size or st_blocks).
+	_, err = w.Append([]byte("payload"))
+	require.NoError(t, err)
+
+	// On macOS F_PREALLOCATE doesn't change Size() (KEEP_SIZE-equivalent), but
+	// the file's allocated blocks should be at least segSize. We check both
+	// st_size AND st_blocks*512 to satisfy Linux+macOS in one assertion.
+	st, err := os.Stat(filepath.Join(dir, "wal-1-"))
+	require.NoError(t, err)
+	allocated := st.Size()
+	if sys, ok := st.Sys().(*syscall.Stat_t); ok {
+		// st_blocks is in 512-byte units; on Linux it reflects fallocated space.
+		if int64(sys.Blocks)*512 > allocated {
+			allocated = int64(sys.Blocks) * 512
+		}
+	}
+	require.GreaterOrEqual(t, allocated, int64(segSize/2),
+		"expected pre-allocated segment >= ~segSize, got %d", allocated)
+
+	require.NoError(t, w.Close())
+}
+
+func TestVerifyOnOpen_RemovesDuplicateRange(t *testing.T) {
+	dir := t.TempDir()
+	w, err := OpenWriter(WriterOptions{
+		Dir:              dir,
+		MaxSegmentSize:   100,
+		CompressOnRotate: true,
+	})
+	require.NoError(t, err)
+	for i := 0; i < 30; i++ {
+		_, err := w.Append([]byte("xxxxxxxxxx"))
+		require.NoError(t, err)
+	}
+	w.awaitRotations()
+	require.NoError(t, w.Close())
+
+	// Synthesize a duplicate: copy one .zst back to its uncompressed form.
+	matches, _ := filepath.Glob(filepath.Join(dir, "wal-*.zst"))
+	require.NotEmpty(t, matches, "expected compressed segments")
+	zstPath := matches[0]
+	uncompressedPath := zstPath[:len(zstPath)-len(".zst")]
+	require.NoError(t, os.WriteFile(uncompressedPath, []byte("dummy uncompressed twin"), 0644))
+
+	// Re-open with VerifyOnOpen — should remove the uncompressed twin.
+	w2, err := OpenWriter(WriterOptions{
+		Dir:          dir,
+		VerifyOnOpen: true,
+	})
+	require.NoError(t, err)
+	defer w2.Close()
+
+	_, err = os.Stat(uncompressedPath)
+	require.True(t, os.IsNotExist(err), "verify should have removed the uncompressed twin: %v", err)
+}
+
+func TestReader_NextBatch(t *testing.T) {
+	dir := t.TempDir()
+	w, err := OpenWriter(WriterOptions{Dir: dir, MaxSegmentSize: 1 << 20})
+	require.NoError(t, err)
+	for i := 0; i < 12; i++ {
+		_, err := w.Append([]byte(fmt.Sprintf("v%d", i)))
+		require.NoError(t, err)
+	}
+	require.NoError(t, w.Close())
+
+	r, err := OpenReader(ReaderOptions{Dir: dir, Name: "batch", StartFrom: StartEarliest})
+	require.NoError(t, err)
+	defer r.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	// First call: ask for 5, expect to get 5 (file has all 12 ready).
+	payloads, indices, err := r.NextBatch(ctx, 5)
+	require.NoError(t, err)
+	require.Equal(t, 5, len(payloads))
+	require.Equal(t, []uint64{1, 2, 3, 4, 5}, indices)
+	require.NoError(t, r.Ack(indices[len(indices)-1]))
+
+	// Second call: ask for 100, but file only has 7 left, EOF stops the drain.
+	payloads2, indices2, err := r.NextBatch(ctx, 100)
+	require.NoError(t, err)
+	require.Equal(t, 7, len(payloads2))
+	require.Equal(t, uint64(12), indices2[len(indices2)-1])
 }
 
 func TestReader_Lag(t *testing.T) {

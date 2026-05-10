@@ -353,6 +353,55 @@ func (r *Reader) Next(ctx context.Context) ([]byte, uint64, error) {
 	}
 }
 
+// NextBatch reads up to `max` records from the current position and returns
+// them. It blocks until at least ONE record is available (or ctx is canceled),
+// then drains as much as it can without further waits — so the second through
+// max-th records are best-effort. Useful when callers want to amortize per-
+// record processing overhead (DB inserts, S3 multipart) but don't want to
+// stall waiting for a full batch on a quiet WAL.
+//
+// Returned slices are length-aligned: payloads[i] corresponds to indices[i].
+// On error mid-batch, returns whatever was read so far + the error; the caller
+// should still Ack(indices[len-1]) for the successful prefix.
+func (r *Reader) NextBatch(ctx context.Context, max int) (payloads [][]byte, indices []uint64, err error) {
+	if max <= 0 {
+		return nil, nil, errors.New("axwal: NextBatch max must be > 0")
+	}
+	// First record: blocking. Reuses Next.
+	first, idx, err := r.Next(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	payloads = append(payloads, first)
+	indices = append(indices, idx)
+
+	// Subsequent records: non-blocking. We try to read directly through the
+	// already-open file. Stop on the first I/O hiccup (EOF, ErrTruncatedRecord,
+	// segment switch) — the caller can come back via NextBatch on the next tick.
+	for len(payloads) < max && r.file != nil {
+		payload, perr := readRecord(r.readerSource())
+		if perr != nil {
+			// Stop gracefully on EOF / truncation; surface real errors only if
+			// we have nothing yet (we don't — we have at least one record).
+			if errors.Is(perr, io.EOF) || errors.Is(perr, ErrTruncatedRecord) {
+				if errors.Is(perr, ErrTruncatedRecord) && r.segIsOpen {
+					// Mirror Next() behavior: drop the file so the next call
+					// re-opens at the proper segment.
+					r.closeCurrentFile()
+				}
+				break
+			}
+			return payloads, indices, perr
+		}
+		nextIdx := r.nextIdx.Load()
+		r.nextIdx.Store(nextIdx + 1)
+		r.cnt.nextCalls.Add(1)
+		payloads = append(payloads, payload)
+		indices = append(indices, nextIdx)
+	}
+	return payloads, indices, nil
+}
+
 // Ack persists `index` as the last successfully processed record. With
 // AckBatchInterval=0 (default) the call returns only after fsync. With
 // AckBatchInterval>0 it's lock-free and the fsync happens in the background.
