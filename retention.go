@@ -1,7 +1,6 @@
 package axwal
 
 import (
-	"log"
 	"os"
 	"path/filepath"
 	"sort"
@@ -20,7 +19,7 @@ func (w *Writer) janitorLoop() {
 			return
 		case <-t.C:
 			if err := w.runRetention(); err != nil {
-				log.Printf("axwal: retention: %v", err)
+				w.log.Error("retention pass", "err", err)
 			}
 		}
 	}
@@ -120,12 +119,14 @@ func (w *Writer) runRetention() error {
 			continue
 		}
 		if err := os.Remove(it.path); err != nil && !os.IsNotExist(err) {
-			log.Printf("axwal: retention: remove %s: %v", it.path, err)
+			w.log.Error("retention: remove failed", "name", it.seg.Name, "err", err)
 			continue
 		}
 		// Clean up the sidecar if it existed.
 		_ = removeArchivedSidecar(w.dir, it.seg)
-		log.Printf("axwal: retention: deleted %s (LastIndex=%d cutoff=%d)", it.seg.Name, it.seg.LastIndex, cutoff)
+		w.cnt.retentionDeletes.Add(1)
+		w.log.Info("retention: deleted segment",
+			"name", it.seg.Name, "last_index", it.seg.LastIndex, "cutoff", cutoff)
 	}
 	return fsyncDir(w.dir)
 }

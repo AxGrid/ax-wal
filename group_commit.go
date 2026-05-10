@@ -1,7 +1,6 @@
 package axwal
 
 import (
-	"log"
 	"time"
 )
 
@@ -32,7 +31,7 @@ func (w *Writer) commitLoop() {
 		}
 		want := w.lastIndex
 		if err := w.flushAndSyncLocked(); err != nil {
-			log.Printf("axwal: group-commit fsync: %v", err)
+			w.log.Error("group-commit fsync failed", "err", err)
 			// Don't advance commitIndex; waiters will keep waiting and the
 			// next tick will retry.
 			w.mu.Unlock()
@@ -70,7 +69,7 @@ func (w *Writer) rotateAgeLoop() {
 			}
 			if time.Since(w.openedAt) >= w.opts.MaxSegmentAge {
 				if err := w.rotateLocked(); err != nil {
-					log.Printf("axwal: age-based rotation: %v", err)
+					w.log.Error("age-based rotation failed", "err", err)
 				}
 			}
 			w.mu.Unlock()

@@ -2,13 +2,27 @@ package axwal
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 )
+
+// ErrBackpressure is returned by Append/AppendBatch when MaxPendingBytes is set
+// and the unflushed-on-disk byte count would exceed it. The caller should slow
+// down or shed load; retrying immediately will just hit the limit again.
+var ErrBackpressure = errors.New("axwal: backpressure (pending bytes exceed MaxPendingBytes)")
+
+// ErrCloseTimeout is returned by Close when CloseTimeout elapsed before all
+// background goroutines (rotations, compressions) finished. The lock is still
+// released and the writer is unusable; partially-rotated segments may remain
+// on disk and will be cleaned up on the next OpenWriter() recovery pass.
+var ErrCloseTimeout = errors.New("axwal: writer close timed out")
 
 // WriterOptions configures a Writer.
 type WriterOptions struct {
@@ -35,8 +49,24 @@ type WriterOptions struct {
 	// SyncMode constants for the trade-offs. Defaults to SyncFull.
 	SyncMode SyncMode
 
+	// MaxPendingBytes, if > 0, makes Append return ErrBackpressure once the
+	// number of bytes written to the bufio buffer but not yet fsynced exceeds
+	// this threshold. Useful with GroupCommit on slow disks: prevents the
+	// caller from queueing unbounded work while the commit goroutine catches up.
+	// 0 = unlimited.
+	MaxPendingBytes int
+
 	// BufferSize is the bufio.Writer size for the active segment. Defaults to 64 KiB.
 	BufferSize int
+
+	// Logger receives all package-internal log events. Defaults to
+	// slog.Default(). Use this to route axwal logs through your central
+	// structured-logging pipeline.
+	Logger *slog.Logger
+
+	// CloseTimeout caps how long Close() waits for in-flight rotations /
+	// compressions to finish. 0 means wait indefinitely (current behavior).
+	CloseTimeout time.Duration
 
 	// GroupCommit, when enabled, batches multiple concurrent Append/AppendBatch
 	// calls into a single fsync. Each Append still BLOCKS until its batch has
@@ -130,11 +160,52 @@ type RetentionConfig struct {
 	RequireArchivedMark bool
 }
 
+// WriterStats is a thread-safe snapshot of writer counters/gauges. Cheap to
+// call in a metrics-scrape loop (no I/O, brief mutex acquisition).
+type WriterStats struct {
+	// Gauges (current state).
+	LastIndex    uint64
+	CommitIndex  uint64
+	FirstIndex   uint64
+	SegmentBytes int64
+	PendingBytes int64
+
+	// Counters (monotonic; reset only on process restart).
+	AppendCalls         uint64
+	AppendRecords       uint64
+	AppendBytes         uint64
+	Rotations           uint64
+	FsyncCalls          uint64
+	FsyncErrors         uint64
+	BackpressureRejects uint64
+	RetentionDeletes    uint64
+}
+
+type writerCounters struct {
+	appendCalls       atomic.Uint64
+	appendRecords     atomic.Uint64
+	appendBytes       atomic.Uint64
+	rotations         atomic.Uint64
+	fsyncCalls        atomic.Uint64
+	fsyncErrors       atomic.Uint64
+	backpressure      atomic.Uint64
+	retentionDeletes  atomic.Uint64
+}
+
 // Writer is the single-process append side of the WAL.
 type Writer struct {
 	opts WriterOptions
 	dir  string
 	lock *writerLock
+	log  *slog.Logger
+
+	// ctx is canceled by Close so that infinite retry loops in the rotation /
+	// compression goroutines exit cleanly. Background work that observes
+	// ctx.Err() != nil should give up and return.
+	ctx       context.Context
+	ctxCancel context.CancelFunc
+
+	cnt writerCounters
 
 	mu         sync.Mutex
 	file       *os.File
@@ -193,6 +264,11 @@ func OpenWriter(opts WriterOptions) (*Writer, error) {
 		}
 	}
 
+	if opts.Logger == nil {
+		opts.Logger = slog.Default()
+	}
+	logger := opts.Logger.With("component", "axwal.writer", "dir", opts.Dir)
+
 	if err := os.MkdirAll(opts.Dir, 0755); err != nil {
 		return nil, fmt.Errorf("mkdir wal dir: %w", err)
 	}
@@ -202,13 +278,17 @@ func OpenWriter(opts WriterOptions) (*Writer, error) {
 		return nil, err
 	}
 
+	ctx, cancel := context.WithCancel(context.Background())
 	w := &Writer{
-		opts: opts,
-		dir:  opts.Dir,
-		lock: lock,
+		opts:      opts,
+		dir:       opts.Dir,
+		lock:      lock,
+		log:       logger,
+		ctx:       ctx,
+		ctxCancel: cancel,
 	}
 
-	last, err := recover_(opts.Dir, opts.CompressOnRotate)
+	last, err := recover_(opts.Dir, opts.CompressOnRotate, logger)
 	if err != nil {
 		_ = lock.Release()
 		return nil, fmt.Errorf("recovery: %w", err)
@@ -248,6 +328,29 @@ func (w *Writer) LastIndex() uint64 {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return w.lastIndex
+}
+
+// Stats returns a thread-safe snapshot of writer counters and gauges suitable
+// for periodic scraping by a metrics system.
+func (w *Writer) Stats() WriterStats {
+	w.mu.Lock()
+	s := WriterStats{
+		LastIndex:    w.lastIndex,
+		CommitIndex:  w.commitIndex,
+		FirstIndex:   w.firstIndex,
+		SegmentBytes: w.curSize,
+		PendingBytes: int64(w.pendingBytes),
+	}
+	w.mu.Unlock()
+	s.AppendCalls = w.cnt.appendCalls.Load()
+	s.AppendRecords = w.cnt.appendRecords.Load()
+	s.AppendBytes = w.cnt.appendBytes.Load()
+	s.Rotations = w.cnt.rotations.Load()
+	s.FsyncCalls = w.cnt.fsyncCalls.Load()
+	s.FsyncErrors = w.cnt.fsyncErrors.Load()
+	s.BackpressureRejects = w.cnt.backpressure.Load()
+	s.RetentionDeletes = w.cnt.retentionDeletes.Load()
+	return s
 }
 
 // NextIndex returns the index that the next Append will assign.
@@ -293,6 +396,15 @@ func (w *Writer) AppendBatch(records [][]byte) ([]uint64, error) {
 		totalSize += int64(len(f))
 	}
 
+	// Backpressure: refuse the write before we've appended anything if it
+	// would push pendingBytes past the configured ceiling. Returning an error
+	// lets producers shed load instead of growing unbounded buffers.
+	if w.opts.MaxPendingBytes > 0 && w.pendingBytes+int(totalSize) > w.opts.MaxPendingBytes {
+		w.cnt.backpressure.Add(1)
+		return nil, fmt.Errorf("%w: pending=%d would-add=%d limit=%d",
+			ErrBackpressure, w.pendingBytes, totalSize, w.opts.MaxPendingBytes)
+	}
+
 	if w.shouldRotateBeforeWriteLocked(totalSize, uint64(len(records))) {
 		if err := w.rotateLocked(); err != nil {
 			return nil, fmt.Errorf("rotate: %w", err)
@@ -311,6 +423,9 @@ func (w *Writer) AppendBatch(records [][]byte) ([]uint64, error) {
 		idxs[i] = w.lastIndex
 	}
 	myMaxIdx := idxs[len(idxs)-1]
+	w.cnt.appendCalls.Add(1)
+	w.cnt.appendRecords.Add(uint64(len(records)))
+	w.cnt.appendBytes.Add(uint64(totalSize))
 
 	if w.opts.GroupCommit.Enabled {
 		// Kick the commit goroutine if our batch alone exceeds the bytes
@@ -367,16 +482,23 @@ func (w *Writer) flushAndSyncLocked() error {
 	return nil
 }
 
-// syncFile applies the configured SyncMode.
+// syncFile applies the configured SyncMode and bumps fsync counters.
 func (w *Writer) syncFile(f *os.File) error {
-	switch w.opts.SyncMode {
-	case SyncNone:
+	if w.opts.SyncMode == SyncNone {
 		return nil
-	case SyncBarrier:
-		return syncBarrier(f)
-	default: // SyncFull
-		return f.Sync()
 	}
+	w.cnt.fsyncCalls.Add(1)
+	var err error
+	switch w.opts.SyncMode {
+	case SyncBarrier:
+		err = syncBarrier(f)
+	default: // SyncFull
+		err = f.Sync()
+	}
+	if err != nil {
+		w.cnt.fsyncErrors.Add(1)
+	}
+	return err
 }
 
 func (w *Writer) kickCommit() {
@@ -404,6 +526,7 @@ func (w *Writer) rotateLocked() error {
 	if err := w.flushAndSyncLocked(); err != nil {
 		return err
 	}
+	w.cnt.rotations.Add(1)
 
 	// Rotation implicitly commits everything written so far.
 	w.commitIndex = w.lastIndex
@@ -515,10 +638,31 @@ func (w *Writer) Close() error {
 		w.rotateAgeWG.Wait()
 	}
 
-	w.rotateWG.Wait()
+	// Cancel the writer ctx so any retry loops in finalizeRotated /
+	// robustCompressZstd give up. Without this they'd loop forever on a stuck
+	// disk and rotateWG.Wait() would hang.
+	w.ctxCancel()
+
+	timedOut := false
+	if w.opts.CloseTimeout > 0 {
+		done := make(chan struct{})
+		go func() { w.rotateWG.Wait(); close(done) }()
+		select {
+		case <-done:
+		case <-time.After(w.opts.CloseTimeout):
+			timedOut = true
+			w.log.Warn("close timeout: abandoning in-flight rotations",
+				"timeout", w.opts.CloseTimeout)
+		}
+	} else {
+		w.rotateWG.Wait()
+	}
 
 	if err := w.lock.Release(); err != nil && firstErr == nil {
 		firstErr = err
+	}
+	if timedOut && firstErr == nil {
+		firstErr = ErrCloseTimeout
 	}
 	return firstErr
 }

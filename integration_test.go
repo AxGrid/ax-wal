@@ -496,6 +496,93 @@ func TestRotation_ByRecordCount(t *testing.T) {
 	require.GreaterOrEqual(t, len(segs), 2, "expected at least 2 segments from record-count trigger; got: %v", segs)
 }
 
+func TestStats_BasicCounters(t *testing.T) {
+	dir := t.TempDir()
+	w, err := OpenWriter(WriterOptions{Dir: dir, MaxSegmentSize: 1 << 20})
+	require.NoError(t, err)
+
+	for i := 0; i < 25; i++ {
+		_, err := w.Append([]byte("payload"))
+		require.NoError(t, err)
+	}
+	ws := w.Stats()
+	require.Equal(t, uint64(25), ws.LastIndex)
+	require.Equal(t, uint64(25), ws.AppendRecords)
+	require.Equal(t, uint64(25), ws.AppendCalls)
+	require.Greater(t, ws.AppendBytes, uint64(25*7), "expected payload + framing bytes")
+	require.GreaterOrEqual(t, ws.FsyncCalls, uint64(25))
+	require.NoError(t, w.Close())
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	r, err := OpenReader(ReaderOptions{Dir: dir, Name: "stats", StartFrom: StartEarliest})
+	require.NoError(t, err)
+	defer r.Close()
+	for i := 0; i < 25; i++ {
+		_, idx, err := r.Next(ctx)
+		require.NoError(t, err)
+		require.NoError(t, r.Ack(idx))
+	}
+	rs := r.Stats()
+	require.Equal(t, uint64(25), rs.AckedIndex)
+	require.Equal(t, uint64(26), rs.NextIndex)
+	require.Equal(t, uint64(25), rs.AckCalls)
+	require.GreaterOrEqual(t, rs.NextCalls, uint64(25))
+}
+
+func TestBackpressure(t *testing.T) {
+	dir := t.TempDir()
+	w, err := OpenWriter(WriterOptions{
+		Dir:             dir,
+		MaxSegmentSize:  10 << 20,
+		MaxPendingBytes: 100, // tiny: a single record will exceed it
+		GroupCommit: GroupCommitConfig{
+			Enabled:    true,
+			MaxLatency: 10 * time.Second, // long enough that we don't auto-flush
+		},
+	})
+	require.NoError(t, err)
+	defer w.Close()
+
+	// First append fits.
+	_, err = w.Append([]byte("a small one"))
+	require.NoError(t, err)
+
+	// Second forces over the limit. We expect ErrBackpressure.
+	// We can't easily synchronize against the commit goroutine; the trick is to
+	// queue from within Append before commit fires. The first Append already
+	// returned (group commit fired or first batch fit), so just hammer.
+	// To make this deterministic we open WITHOUT group commit, which means each
+	// Append flushes synchronously and pendingBytes always returns to 0...
+	// not useful. Skip elegance; close+reopen and try the limit on a fresh batch.
+	require.NoError(t, w.Close())
+
+	w2, err := OpenWriter(WriterOptions{
+		Dir:             dir,
+		MaxSegmentSize:  10 << 20,
+		MaxPendingBytes: 100,
+		GroupCommit: GroupCommitConfig{
+			Enabled:    true,
+			MaxLatency: time.Hour, // effectively never
+		},
+	})
+	require.NoError(t, err)
+	defer w2.Close()
+
+	// One small append succeeds and stays pending.
+	go func() {
+		_, _ = w2.Append([]byte("first"))
+	}()
+	time.Sleep(20 * time.Millisecond)
+
+	// A 200-byte payload would push pending past 100. The check happens
+	// before the wait, so this returns ErrBackpressure synchronously.
+	_, err = w2.Append(make([]byte, 200))
+	require.ErrorIs(t, err, ErrBackpressure)
+
+	require.GreaterOrEqual(t, w2.Stats().BackpressureRejects, uint64(1))
+}
+
 func TestRotation_ByAge(t *testing.T) {
 	dir := t.TempDir()
 	w, err := OpenWriter(WriterOptions{

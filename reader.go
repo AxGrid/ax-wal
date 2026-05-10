@@ -6,11 +6,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
@@ -66,6 +67,21 @@ type ReaderOptions struct {
 	// PollInterval is the fallback wakeup interval when fsnotify isn't usable
 	// or just to bound latency. Defaults to 100ms.
 	PollInterval time.Duration
+
+	// Logger receives reader-side log events. Defaults to slog.Default().
+	Logger *slog.Logger
+}
+
+// ReaderStats is a thread-safe snapshot of reader counters/gauges.
+type ReaderStats struct {
+	Name           string
+	NextIndex      uint64
+	AckedIndex     uint64
+	NextCalls      uint64
+	AckCalls       uint64
+	ErrCorruptSegs uint64 // closed segments that returned ErrCorruptRecord
+	SegmentSwitches uint64
+	WaitWakeups    uint64
 }
 
 // Reader is a tail-and-follow consumer of a WAL.
@@ -74,9 +90,14 @@ type Reader struct {
 	opts  ReaderOptions
 	cur   *cursorState
 	notif *notifier
+	log   *slog.Logger
 
-	// nextIdx is the index of the record to be returned by the next Next() call.
-	nextIdx uint64
+	cnt readerCounters
+
+	// nextIdx is the index of the record to be returned by the next Next()
+	// call. Atomic so Stats() can read it from another goroutine; the Reader
+	// itself is contractually single-goroutine (Next not safe for concurrent use).
+	nextIdx atomic.Uint64
 
 	// segPath is the file currently open (may be the live open segment, a
 	// closed segment, or a .zst). Empty if none open.
@@ -89,6 +110,14 @@ type Reader struct {
 	file    *os.File
 	br      *bufio.Reader
 	zstd    *zstd.Decoder
+}
+
+type readerCounters struct {
+	nextCalls       atomic.Uint64
+	ackCalls        atomic.Uint64
+	errCorruptSegs  atomic.Uint64
+	segmentSwitches atomic.Uint64
+	waitWakeups     atomic.Uint64
 }
 
 // OpenReader registers a reader with the given name. Returns an error if a
@@ -106,6 +135,10 @@ func OpenReader(opts ReaderOptions) (*Reader, error) {
 	if opts.PollInterval <= 0 {
 		opts.PollInterval = 100 * time.Millisecond
 	}
+	if opts.Logger == nil {
+		opts.Logger = slog.Default()
+	}
+	logger := opts.Logger.With("component", "axwal.reader", "dir", opts.Dir, "name", opts.Name)
 
 	cs, err := openCursor(opts.Dir, opts.Name)
 	if err != nil {
@@ -125,12 +158,13 @@ func OpenReader(opts ReaderOptions) (*Reader, error) {
 		dir:  opts.Dir,
 		opts: opts,
 		cur:  cs,
+		log:  logger,
 	}
 
 	// Determine starting index.
 	if cs.rec.Index > 0 {
 		// Resume after the last Ack'd record.
-		r.nextIdx = cs.rec.Index + 1
+		r.nextIdx.Store(cs.rec.Index + 1)
 	} else {
 		switch opts.StartFrom {
 		case StartLatest:
@@ -139,13 +173,13 @@ func OpenReader(opts ReaderOptions) (*Reader, error) {
 				_ = cs.Close()
 				return nil, err
 			}
-			r.nextIdx = latest + 1
+			r.nextIdx.Store(latest + 1)
 		case StartAt:
 			if opts.StartAtIndex == 0 {
 				_ = cs.Close()
 				return nil, errors.New("axwal: StartAt requires StartAtIndex > 0")
 			}
-			r.nextIdx = opts.StartAtIndex
+			r.nextIdx.Store(opts.StartAtIndex)
 		default: // StartEarliest
 			earliest, err := r.scanFirstIndex()
 			if err != nil {
@@ -155,15 +189,16 @@ func OpenReader(opts ReaderOptions) (*Reader, error) {
 			if earliest == 0 {
 				earliest = 1
 			}
-			r.nextIdx = earliest
+			r.nextIdx.Store(earliest)
 		}
 	}
 
 	// Fast-forward: if the cursor (or StartAt) points at an index that retention
 	// has already deleted, jump to the earliest available index and warn.
-	if earliest, err := r.scanFirstIndex(); err == nil && earliest > 0 && r.nextIdx < earliest {
-		log.Printf("axwal: reader %q: cursor index %d is below earliest available %d; fast-forwarding (data loss)", opts.Name, r.nextIdx, earliest)
-		r.nextIdx = earliest
+	if earliest, err := r.scanFirstIndex(); err == nil && earliest > 0 && r.nextIdx.Load() < earliest {
+		logger.Warn("cursor below earliest available; fast-forwarding (data loss)",
+			"cursor_index", r.nextIdx.Load(), "earliest", earliest)
+		r.nextIdx.Store(earliest)
 	}
 
 	cs.startHeartbeat(opts.HeartbeatInterval)
@@ -178,6 +213,20 @@ func OpenReader(opts ReaderOptions) (*Reader, error) {
 	return r, nil
 }
 
+// Stats returns a thread-safe snapshot of reader counters and gauges.
+func (r *Reader) Stats() ReaderStats {
+	return ReaderStats{
+		Name:            r.opts.Name,
+		NextIndex:       r.nextIdx.Load(),
+		AckedIndex:      r.cur.CurrentIndex(),
+		NextCalls:       r.cnt.nextCalls.Load(),
+		AckCalls:        r.cnt.ackCalls.Load(),
+		ErrCorruptSegs:  r.cnt.errCorruptSegs.Load(),
+		SegmentSwitches: r.cnt.segmentSwitches.Load(),
+		WaitWakeups:     r.cnt.waitWakeups.Load(),
+	}
+}
+
 // Next blocks until the next record is available (tail-and-follow) or ctx is
 // canceled. Returns (payload, index, nil) on success.
 //
@@ -185,6 +234,7 @@ func OpenReader(opts ReaderOptions) (*Reader, error) {
 // processing of the returned record is complete and durable from your side.
 // On reader restart you'll resume at index+1.
 func (r *Reader) Next(ctx context.Context) ([]byte, uint64, error) {
+	r.cnt.nextCalls.Add(1)
 	for {
 		// Make sure we have a segment that contains nextIdx.
 		if r.file == nil {
@@ -203,8 +253,8 @@ func (r *Reader) Next(ctx context.Context) ([]byte, uint64, error) {
 		payload, err := readRecord(r.readerSource())
 		switch {
 		case err == nil:
-			idx := r.nextIdx
-			r.nextIdx++
+			idx := r.nextIdx.Load()
+			r.nextIdx.Store(idx + 1)
 			return payload, idx, nil
 
 		case errors.Is(err, io.EOF):
@@ -250,9 +300,12 @@ func (r *Reader) Next(ctx context.Context) ([]byte, uint64, error) {
 	}
 }
 
-// Ack persists `index` as the last successfully processed record. Fsynced.
+// Ack persists `index` as the last successfully processed record. With
+// AckBatchInterval=0 (default) the call returns only after fsync. With
+// AckBatchInterval>0 it's lock-free and the fsync happens in the background.
 // Index must be >= the previously Ack'd index.
 func (r *Reader) Ack(index uint64) error {
+	r.cnt.ackCalls.Add(1)
 	return r.cur.Ack(index)
 }
 
@@ -263,7 +316,7 @@ func (r *Reader) CurrentIndex() uint64 {
 
 // NextIndex returns the index of the next record that Next() will produce.
 func (r *Reader) NextIndex() uint64 {
-	return r.nextIdx
+	return r.nextIdx.Load()
 }
 
 // Close releases resources but does NOT delete the cursor. Re-opening with the
@@ -303,7 +356,7 @@ func (r *Reader) closeCurrentFile() {
 // openSegmentForIndex opens whichever segment contains r.nextIdx. If none is
 // available yet, leaves r.file == nil and returns nil error (caller will wait).
 func (r *Reader) openSegmentForIndex(ctx context.Context) error {
-	target := r.nextIdx
+	target := r.nextIdx.Load()
 	candidates, err := r.listSegments()
 	if err != nil {
 		return err
@@ -352,10 +405,11 @@ func (r *Reader) openSegment(s segName) error {
 	r.segIsOpen = !s.Closed
 
 	// Skip records until we land on r.nextIdx.
-	skip := r.nextIdx - r.segFirst
+	target := r.nextIdx.Load()
+	skip := target - r.segFirst
 	for i := uint64(0); i < skip; i++ {
 		if _, err := readRecord(r.br); err != nil {
-			return fmt.Errorf("skipping to index %d in %s: %w", r.nextIdx, s.Name, err)
+			return fmt.Errorf("skipping to index %d in %s: %w", target, s.Name, err)
 		}
 	}
 	return nil
@@ -368,7 +422,7 @@ func (r *Reader) tryAdvanceSegment() (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	target := r.nextIdx
+	target := r.nextIdx.Load()
 
 	// First: a closed segment containing target (could be the rotated form of
 	// what was previously the open segment).
@@ -465,7 +519,7 @@ func (r *Reader) scanLastIndex() (uint64, error) {
 	if last.Closed {
 		return last.LastIndex, nil
 	}
-	idx, _, err := readOpenSegmentTail(filepath.Join(r.dir, last.Name), last.FirstIndex)
+	idx, _, err := readOpenSegmentTail(filepath.Join(r.dir, last.Name), last.FirstIndex, r.log)
 	return idx, err
 }
 

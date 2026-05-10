@@ -1,9 +1,11 @@
 package axwal
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -17,16 +19,24 @@ const (
 	compressionRetryInterval = 500 * time.Millisecond
 )
 
-// finalizeRotated runs in its own goroutine after rotation. It renames the open
-// segment to wal-F-L and (optionally) compresses it to .zst, retrying on transient
-// I/O errors. It must not panic — the writer's correctness depends only on the
-// rename eventually succeeding.
+// finalizeRotated runs in its own goroutine after rotation. It renames the
+// open segment to wal-F-L and (optionally) compresses it to .zst, retrying on
+// transient I/O errors. The writer's ctx provides cancellation: when Close()
+// fires, in-flight retries give up cleanly and the segment is left in
+// whatever intermediate state it reached (recovery on next OpenWriter handles
+// that — see recover_).
 func (w *Writer) finalizeRotated(openPath string, first, last uint64) {
 	defer w.rotateWG.Done()
 
 	finalPath := filepath.Join(w.dir, formatClosedName(first, last))
-	if err := robustRename(openPath, finalPath); err != nil {
-		log.Printf("axwal: finalize rename %s -> %s: %v", openPath, finalPath, err)
+	if err := robustRename(w.ctx, w.log, openPath, finalPath); err != nil {
+		if errors.Is(err, context.Canceled) {
+			w.log.Warn("rotation rename abandoned (writer closing)",
+				"old", filepath.Base(openPath), "new", filepath.Base(finalPath))
+			return
+		}
+		w.log.Error("rotation rename failed", "old", filepath.Base(openPath),
+			"new", filepath.Base(finalPath), "err", err)
 		return
 	}
 
@@ -34,37 +44,69 @@ func (w *Writer) finalizeRotated(openPath string, first, last uint64) {
 		return
 	}
 	zstPath := finalPath + ".zst"
-	if err := robustCompressZstd(finalPath, zstPath); err != nil {
-		log.Printf("axwal: zstd compress %s -> %s: %v (leaving uncompressed)", finalPath, zstPath, err)
+	if err := robustCompressZstd(w.ctx, w.log, finalPath, zstPath); err != nil {
+		if errors.Is(err, context.Canceled) {
+			w.log.Warn("compression abandoned (writer closing)",
+				"src", filepath.Base(finalPath))
+			return
+		}
+		w.log.Error("zstd compress failed (leaving uncompressed)",
+			"src", filepath.Base(finalPath), "dst", filepath.Base(zstPath), "err", err)
 	}
 }
 
-func robustRename(oldPath, newPath string) error {
+// sleepCtx waits for d or until ctx is done. Returns the ctx error on cancel.
+func sleepCtx(ctx context.Context, d time.Duration) error {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
+	}
+}
+
+func robustRename(ctx context.Context, log *slog.Logger, oldPath, newPath string) error {
 	for attempt := 1; ; attempt++ {
-		if err := os.Rename(oldPath, newPath); err == nil {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		err := os.Rename(oldPath, newPath)
+		if err == nil {
 			if attempt > 2 {
-				log.Printf("axwal: rename %s -> %s succeeded after %d attempts", oldPath, newPath, attempt)
+				log.Info("rename succeeded after retries",
+					"old", filepath.Base(oldPath), "new", filepath.Base(newPath), "attempts", attempt)
 			}
 			return nil
-		} else if attempt > 2 {
-			log.Printf("axwal: rename attempt %d failed: %v; retry in %s", attempt, err, renameRetryInterval)
 		}
-		time.Sleep(renameRetryInterval)
+		if attempt > 2 {
+			log.Warn("rename retrying", "attempts", attempt, "err", err,
+				"old", filepath.Base(oldPath), "new", filepath.Base(newPath))
+		}
+		if err := sleepCtx(ctx, renameRetryInterval); err != nil {
+			return err
+		}
 	}
 }
 
-func robustCompressZstd(src, dst string) error {
+func robustCompressZstd(ctx context.Context, log *slog.Logger, src, dst string) error {
 	for attempt := 1; ; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		err := compressOnceZstd(src, dst)
 		if err == nil {
 			if rmErr := os.Remove(src); rmErr != nil {
-				log.Printf("axwal: compress: failed to remove %s after success: %v", src, rmErr)
+				log.Warn("compress: remove source failed", "src", filepath.Base(src), "err", rmErr)
 			}
 			return nil
 		}
-		log.Printf("axwal: compress attempt %d for %s failed: %v; retry in %s", attempt, src, err, compressionRetryInterval)
+		log.Warn("compress retrying", "src", filepath.Base(src), "attempts", attempt, "err", err)
 		_ = os.Remove(dst)
-		time.Sleep(compressionRetryInterval)
+		if err := sleepCtx(ctx, compressionRetryInterval); err != nil {
+			return err
+		}
 	}
 }
 

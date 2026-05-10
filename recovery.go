@@ -5,7 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
@@ -25,7 +25,7 @@ import (
 //
 // This treats CRC failure or trailing zeros at the tail of an open segment as
 // "torn write at crash time" and discards them.
-func recover_(dir string, compressOnRotate bool) (uint64, error) {
+func recover_(dir string, compressOnRotate bool, log *slog.Logger) (uint64, error) {
 	matches, err := filepath.Glob(filepath.Join(dir, "wal-*"))
 	if err != nil {
 		return 0, fmt.Errorf("glob: %w", err)
@@ -42,7 +42,7 @@ func recover_(dir string, compressOnRotate bool) (uint64, error) {
 		}
 		s, err := parseSegName(base)
 		if err != nil {
-			log.Printf("axwal: recovery: skipping unrecognized %q: %v", base, err)
+			log.Warn("recovery: skipping unrecognized file", "name", base, "err", err)
 			continue
 		}
 		if s.Closed {
@@ -63,11 +63,11 @@ func recover_(dir string, compressOnRotate bool) (uint64, error) {
 			if err := os.Remove(path); err != nil {
 				return 0, fmt.Errorf("remove empty %s: %w", path, err)
 			}
-			log.Printf("axwal: recovery: removed empty open segment %s", base(path))
+			log.Info("recovery: removed empty open segment", "name", base(path))
 			continue
 		}
 
-		actualLast, validBytes, err := readOpenSegmentTail(path, s.FirstIndex)
+		actualLast, validBytes, err := readOpenSegmentTail(path, s.FirstIndex, log)
 		if err != nil {
 			return 0, fmt.Errorf("scan open segment %s: %w", path, err)
 		}
@@ -82,7 +82,7 @@ func recover_(dir string, compressOnRotate bool) (uint64, error) {
 			if err := os.Remove(path); err != nil {
 				return 0, fmt.Errorf("remove empty after trunc %s: %w", path, err)
 			}
-			log.Printf("axwal: recovery: open segment %s held no valid records, removed", base(path))
+			log.Info("recovery: open segment held no valid records, removed", "name", base(path))
 			continue
 		}
 
@@ -97,14 +97,16 @@ func recover_(dir string, compressOnRotate bool) (uint64, error) {
 			LastIndex:  actualLast,
 			Closed:     true,
 		})
-		log.Printf("axwal: recovery: finalized %s -> %s (records=%d)", base(path), finalName, actualLast-s.FirstIndex+1)
+		log.Info("recovery: finalized open segment",
+			"old", base(path), "new", finalName, "records", actualLast-s.FirstIndex+1)
 
 		if compressOnRotate {
 			zstPath := finalPath + ".zst"
 			if err := compressOnceZstd(finalPath, zstPath); err == nil {
 				_ = os.Remove(finalPath)
 			} else {
-				log.Printf("axwal: recovery: compress %s failed: %v (leaving uncompressed)", finalName, err)
+				log.Warn("recovery: compress failed (leaving uncompressed)",
+					"name", finalName, "err", err)
 				_ = os.Remove(zstPath)
 			}
 		}
@@ -126,7 +128,7 @@ func recover_(dir string, compressOnRotate bool) (uint64, error) {
 // the last valid record. Returns:
 //   - lastIndex (firstIndex-1 if zero records were valid)
 //   - validBytes: the file offset just past the last valid record (where to truncate)
-func readOpenSegmentTail(path string, firstIndex uint64) (uint64, int64, error) {
+func readOpenSegmentTail(path string, firstIndex uint64, log *slog.Logger) (uint64, int64, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return 0, 0, err
@@ -148,7 +150,8 @@ func readOpenSegmentTail(path string, firstIndex uint64) (uint64, int64, error) 
 		}
 		if err != nil {
 			if errors.Is(err, ErrCorruptRecord) || errors.Is(err, ErrTruncatedRecord) {
-				log.Printf("axwal: recovery: %s tail at offset %d: %v (truncating)", filepath.Base(path), startPos, err)
+				log.Warn("recovery: truncating segment at corrupt/short frame",
+					"name", filepath.Base(path), "offset", startPos, "err", err)
 				return last, startPos, nil
 			}
 			return 0, 0, err
