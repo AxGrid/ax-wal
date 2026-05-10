@@ -544,6 +544,50 @@ Logs go through `*slog.Logger` (configurable via `WriterOptions.Logger` /
 `ReaderOptions.Logger`). Every line carries `dir` and (for readers) `name`
 as keys.
 
+## Drop-in for legacy `github.com/axgrid/axq`
+
+If you have existing code written against the older `github.com/axgrid/axq`
+Writer/Reader interfaces, the `axqcompat` sub-module exposes ax-wal under
+the same surface so call sites don't change:
+
+```go
+import (
+    axwal    "github.com/axgrid/ax-wal"
+    "github.com/axgrid/ax-wal/axqcompat"
+    "github.com/axgrid/axq"      // legacy interfaces
+)
+
+rawW, _ := axwal.OpenWriter(axwal.WriterOptions{Dir: "/var/lib/wal"})
+var w axq.Writer = mustWriter(axqcompat.NewWriter(axqcompat.WriterOptions{
+    Writer: rawW, Dir: "/var/lib/wal",
+    Name:   "tx-producer", CloseUnderlying: true,
+}))
+
+w.Push(payload)        // → ax-wal Writer.Append
+w.LastFID()            // F of the open wal-{F}- segment
+w.MinimalFID()         // F of the oldest segment still on disk
+w.Performance()        // rec/s rolling 1-second window
+
+// Reader side:
+rawR, _ := axwal.OpenReader(axwal.ReaderOptions{Dir: "/var/lib/wal", Name: "consumer"})
+r, _ := axqcompat.NewReader(axqcompat.ReaderOptions{
+    Reader: rawR, Dir: "/var/lib/wal",
+    Name:   "consumer", WriterName: "tx-producer",
+    Ctx: ctx, CloseUnderlying: true,
+})
+for msg := range r.C() {
+    if err := process(msg.Message()); err != nil {
+        msg.Error(err)   // does NOT ack → next reader replay
+        continue
+    }
+    msg.Done()           // → Reader.Ack(idx)
+}
+```
+
+Sub-module's own `go.mod` keeps axq's heavy deps (gorm, zerolog, b2, uuid)
+out of the lean core. See [`axqcompat/README.md`](axqcompat/README.md) for
+the full method-by-method mapping table.
+
 ## Limits
 
 - 256 MiB hard cap per individual record (`maxRecordSize` in `framing.go`).
