@@ -29,7 +29,14 @@ func acquireWriterLock(dir string) (*writerLock, error) {
 		if err == syscall.EWOULDBLOCK {
 			pid := readPID(path)
 			if pid > 0 {
-				return nil, fmt.Errorf("axwal: another writer (PID %d) holds %s", pid, dir)
+				// flock guarantees the holder process is alive (kernel releases
+				// the lock on process exit). Phrase the error to reflect that.
+				if pidAlive(pid) {
+					return nil, fmt.Errorf("axwal: another writer (PID %d, alive) holds %s", pid, dir)
+				}
+				// Shouldn't happen on healthy POSIX; surface the oddity.
+				return nil, fmt.Errorf("axwal: lock contention for %s (recorded PID %d not alive — flock state is inconsistent; consider removing %s)",
+					dir, pid, filepath.Join(dir, writerLockFile))
 			}
 			return nil, fmt.Errorf("axwal: another writer holds %s", dir)
 		}
@@ -80,4 +87,18 @@ func readPID(path string) int {
 	var pid int
 	_, _ = fmt.Sscanf(string(b), "%d", &pid)
 	return pid
+}
+
+// pidAlive returns true when the given PID exists and signals can be sent to
+// it. POSIX kill(pid, 0) doesn't actually signal — it just returns ESRCH if
+// the process is gone. False positive: if the PID has been recycled by an
+// unrelated process, we'll say "alive" but the lock is functionally stale.
+// flock's kernel-level holder bookkeeping is the real source of truth; this
+// is purely a friendlier error message.
+func pidAlive(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	err := syscall.Kill(pid, 0)
+	return err == nil || err == syscall.EPERM
 }

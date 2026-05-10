@@ -496,6 +496,66 @@ func TestRotation_ByRecordCount(t *testing.T) {
 	require.GreaterOrEqual(t, len(segs), 2, "expected at least 2 segments from record-count trigger; got: %v", segs)
 }
 
+func TestCursor_CRCDetectsCorruption(t *testing.T) {
+	dir := t.TempDir()
+	w, err := OpenWriter(WriterOptions{Dir: dir, MaxSegmentSize: 1 << 20})
+	require.NoError(t, err)
+	for i := 0; i < 5; i++ {
+		_, err := w.Append([]byte("x"))
+		require.NoError(t, err)
+	}
+	require.NoError(t, w.Close())
+
+	// Read + Ack so the cursor file exists in the new framed format.
+	r, err := OpenReader(ReaderOptions{Dir: dir, Name: "victim", StartFrom: StartEarliest})
+	require.NoError(t, err)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	for i := 0; i < 3; i++ {
+		_, idx, err := r.Next(ctx)
+		require.NoError(t, err)
+		require.NoError(t, r.Ack(idx))
+	}
+	require.NoError(t, r.Close())
+
+	// Corrupt the JSON body inside the cursor file (preserve magic + CRC field
+	// so the reader actually attempts the framed path and notices the mismatch).
+	cpath := filepath.Join(dir, cursorsSubdir, "victim.cursor")
+	body, err := os.ReadFile(cpath)
+	require.NoError(t, err)
+	require.Greater(t, len(body), 12)
+	body[len(body)-1] ^= 0xFF // mangle a JSON byte
+	require.NoError(t, os.WriteFile(cpath, body, 0644))
+
+	// OpenReader must surface ErrCorruptCursor.
+	_, err = OpenReader(ReaderOptions{Dir: dir, Name: "victim"})
+	require.ErrorIs(t, err, ErrCorruptCursor, "got: %v", err)
+}
+
+func TestCursor_LegacyRawJSONStillReadable(t *testing.T) {
+	dir := t.TempDir()
+	w, err := OpenWriter(WriterOptions{Dir: dir, MaxSegmentSize: 1 << 20})
+	require.NoError(t, err)
+	for i := 0; i < 3; i++ {
+		_, err := w.Append([]byte("y"))
+		require.NoError(t, err)
+	}
+	require.NoError(t, w.Close())
+
+	// Plant a legacy (raw-JSON, no magic, no CRC) cursor — the kind written
+	// by versions of ax-wal that pre-date the framed cursor format.
+	cdir := filepath.Join(dir, cursorsSubdir)
+	require.NoError(t, os.MkdirAll(cdir, 0755))
+	body := []byte(`{"name":"oldfmt","index":2,"pid":1,"started_at_unix":1,"last_heartbeat_unix":` + fmt.Sprint(time.Now().Unix()) + `}`)
+	require.NoError(t, os.WriteFile(filepath.Join(cdir, "oldfmt.cursor"), body, 0644))
+
+	// Reader should accept it and resume at index 3.
+	r, err := OpenReader(ReaderOptions{Dir: dir, Name: "oldfmt"})
+	require.NoError(t, err)
+	defer r.Close()
+	require.Equal(t, uint64(3), r.NextIndex())
+}
+
 func TestStats_BasicCounters(t *testing.T) {
 	dir := t.TempDir()
 	w, err := OpenWriter(WriterOptions{Dir: dir, MaxSegmentSize: 1 << 20})

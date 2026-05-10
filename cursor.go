@@ -1,9 +1,11 @@
 package axwal
 
 import (
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,6 +14,16 @@ import (
 	"syscall"
 	"time"
 )
+
+// Cursor on-disk format:
+//   [4B "AXC1" magic][4B BE crc32c of payload][N bytes JSON payload]
+// Legacy (pre-CRC) cursors stored a raw JSON object; readCursorFile detects
+// missing magic and accepts those for backward compatibility, with a warning.
+var cursorMagic = [4]byte{'A', 'X', 'C', '1'}
+
+// ErrCorruptCursor indicates a cursor file failed CRC validation. Reader
+// callers can decide what to do: bail out (default) or fast-forward.
+var ErrCorruptCursor = errors.New("axwal: cursor CRC mismatch")
 
 // cursorsSubdir holds one file per registered reader.
 const cursorsSubdir = "cursors"
@@ -190,16 +202,22 @@ func (cs *cursorState) CurrentIndex() uint64 {
 }
 
 // persist writes rec atomically: tmp -> fsync -> rename -> fsync(dir).
+// Format: [magic][crc32c(body)][JSON body].
 func (cs *cursorState) persist(rec cursorRecord) error {
 	body, err := json.Marshal(rec)
 	if err != nil {
 		return err
 	}
+	frame := make([]byte, 8+len(body))
+	copy(frame[0:4], cursorMagic[:])
+	binary.BigEndian.PutUint32(frame[4:8], crc32.Checksum(body, crcTable))
+	copy(frame[8:], body)
+
 	f, err := os.OpenFile(cs.tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
 	if err != nil {
 		return err
 	}
-	if _, err := f.Write(body); err != nil {
+	if _, err := f.Write(frame); err != nil {
 		f.Close()
 		return err
 	}
@@ -249,6 +267,11 @@ func (cs *cursorState) releaseLock() error {
 	return closeErr
 }
 
+// readCursorFile parses either the new framed format (magic+crc+body) or a
+// legacy raw-JSON cursor. Returns (rec, exists, error). Returns ErrCorruptCursor
+// only when the framed format's CRC fails — JSON parse errors fall through to a
+// generic error so callers can distinguish "cursor was corrupted by torn write"
+// from "cursor file is total garbage".
 func readCursorFile(path string) (cursorRecord, bool, error) {
 	b, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
@@ -257,6 +280,23 @@ func readCursorFile(path string) (cursorRecord, bool, error) {
 	if err != nil {
 		return cursorRecord{}, false, err
 	}
+
+	// Framed format starts with our magic.
+	if len(b) >= 8 && b[0] == cursorMagic[0] && b[1] == cursorMagic[1] && b[2] == cursorMagic[2] && b[3] == cursorMagic[3] {
+		want := binary.BigEndian.Uint32(b[4:8])
+		body := b[8:]
+		got := crc32.Checksum(body, crcTable)
+		if got != want {
+			return cursorRecord{}, false, fmt.Errorf("%w (%s): want %08x got %08x", ErrCorruptCursor, path, want, got)
+		}
+		var rec cursorRecord
+		if err := json.Unmarshal(body, &rec); err != nil {
+			return cursorRecord{}, false, fmt.Errorf("parse framed cursor %s: %w", path, err)
+		}
+		return rec, true, nil
+	}
+
+	// Legacy cursors written before CRC framing was introduced: raw JSON.
 	var rec cursorRecord
 	if err := json.Unmarshal(b, &rec); err != nil {
 		return cursorRecord{}, false, fmt.Errorf("parse cursor %s: %w", path, err)
