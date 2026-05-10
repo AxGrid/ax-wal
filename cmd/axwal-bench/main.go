@@ -70,6 +70,7 @@ func main() {
 	maxSegRecs := flag.Uint64("max-segment-records", 0, "max records per segment (0=disabled)")
 	requireArchived := flag.Bool("require-archived", false, "block deletion until .archived sidecar present")
 	ackEvery := flag.Uint64("ack-every", 1, "Ack the cursor only every N records (1 = strict at-least-once, higher = faster reads at risk of replay window)")
+	replayCount := flag.Uint64("replay-count", 0, "REPLAY MODE: pre-populate this many records, then time a fresh reader draining them all (no concurrent writer)")
 	flag.Parse()
 
 	if *size < headerSize {
@@ -106,10 +107,18 @@ func main() {
 			requireArchived: *requireArchived,
 			ackEvery:        *ackEvery,
 		}
-		log.Printf("=== run: size=%s writers=%d group-commit=%v duration=%s dir=%s",
-			humanBytes(int64(sz)), cfg.writers, cfg.groupCommit, cfg.duration, cfg.dir)
-		r := runOne(cfg)
-		printResult(r)
+		var r result
+		if *replayCount > 0 {
+			log.Printf("=== replay: size=%s count=%d ack-every=%d dir=%s",
+				humanBytes(int64(sz)), *replayCount, cfg.ackEvery, cfg.dir)
+			r = runReplay(cfg, *replayCount)
+			printReplayResult(r)
+		} else {
+			log.Printf("=== run: size=%s writers=%d group-commit=%v duration=%s dir=%s",
+				humanBytes(int64(sz)), cfg.writers, cfg.groupCommit, cfg.duration, cfg.dir)
+			r = runOne(cfg)
+			printResult(r)
+		}
 		results = append(results, r)
 	}
 
@@ -307,6 +316,122 @@ func printResult(r result) {
 	fmt.Printf("reads:         %10s/s  (%d total, lag at end = %d)\n", commaSep(int64(rRate)), r.totalRead, int64(r.totalWritten)-int64(r.totalRead))
 	fmt.Printf("write latency: p50=%9s  p95=%9s  p99=%9s\n", humanDur(wp50), humanDur(wp95), humanDur(wp99))
 	fmt.Printf("read latency:  p50=%9s  p95=%9s  p99=%9s   (write→read)\n", humanDur(rp50), humanDur(rp95), humanDur(rp99))
+	fmt.Printf("disk:          %s across %d closed segments\n", humanBytes(r.bytesOnDisk), r.rotations)
+}
+
+// runReplay pre-populates the WAL with `count` records and then measures how
+// fast a fresh reader can drain them all from Earliest.
+func runReplay(cfg runConfig, count uint64) result {
+	// Phase 1: produce N records as fast as we can. Use AppendBatch to amortize
+	// fsync — replay benchmarks the READ path, not the write path.
+	w, err := axwal.OpenWriter(axwal.WriterOptions{
+		Dir:              cfg.dir,
+		MaxSegmentSize:   cfg.maxSegmentSize,
+		CompressOnRotate: cfg.compress,
+		// No group commit for the prepopulate phase: we're doing one big
+		// AppendBatch, which is already a single fsync.
+	})
+	if err != nil {
+		log.Fatalf("open writer: %v", err)
+	}
+
+	const batchSize = 1024
+	payload := make([]byte, cfg.payloadSize)
+	prepStart := time.Now()
+	for produced := uint64(0); produced < count; {
+		take := batchSize
+		if uint64(take) > count-produced {
+			take = int(count - produced)
+		}
+		batch := make([][]byte, take)
+		for i := 0; i < take; i++ {
+			seq := produced + uint64(i) + 1
+			binary.BigEndian.PutUint64(payload[0:8], seq)
+			ts := time.Now().UnixNano()
+			binary.BigEndian.PutUint64(payload[8:16], uint64(ts))
+			rec := make([]byte, cfg.payloadSize)
+			copy(rec, payload)
+			batch[i] = rec
+		}
+		if _, err := w.AppendBatch(batch); err != nil {
+			log.Fatalf("prepopulate AppendBatch: %v", err)
+		}
+		produced += uint64(take)
+	}
+	if err := w.Close(); err != nil {
+		log.Fatalf("close writer: %v", err)
+	}
+	prepElapsed := time.Since(prepStart)
+	log.Printf("  prepopulated %d records (%s) in %s = %.0f rec/s",
+		count, humanBytes(int64(count)*int64(cfg.payloadSize)), prepElapsed,
+		float64(count)/prepElapsed.Seconds())
+
+	// Phase 2: open a FRESH reader from earliest, time draining everything.
+	r, err := axwal.OpenReader(axwal.ReaderOptions{
+		Dir:               cfg.dir,
+		Name:              "replay",
+		StartFrom:         axwal.StartEarliest,
+		HeartbeatInterval: time.Second,
+		PollInterval:      5 * time.Millisecond,
+	})
+	if err != nil {
+		log.Fatalf("open reader: %v", err)
+	}
+	defer r.Close()
+
+	ackEvery := cfg.ackEvery
+	if ackEvery == 0 {
+		ackEvery = 1
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	readLat := make([]int64, 0, count)
+	readStart := time.Now()
+	var lastAck uint64
+	since := uint64(0)
+	for read := uint64(0); read < count; read++ {
+		recvStart := time.Now()
+		_, idx, err := r.Next(ctx)
+		if err != nil {
+			log.Fatalf("Next at %d: %v", read, err)
+		}
+		readLat = append(readLat, time.Since(recvStart).Nanoseconds())
+		lastAck = idx
+		since++
+		if since >= ackEvery {
+			if err := r.Ack(idx); err != nil {
+				log.Fatalf("Ack: %v", err)
+			}
+			since = 0
+		}
+	}
+	if since > 0 {
+		_ = r.Ack(lastAck)
+	}
+	readElapsed := time.Since(readStart)
+
+	res := result{
+		cfg:          cfg,
+		totalWritten: count,
+		totalRead:    count,
+		readLat:      readLat,
+		elapsed:      readElapsed,
+	}
+	res.bytesOnDisk, res.rotations = inspectDir(cfg.dir)
+	return res
+}
+
+func printReplayResult(r result) {
+	rate := float64(r.totalRead) / r.elapsed.Seconds()
+	mb := rate * float64(r.cfg.payloadSize) / (1 << 20)
+	rp50, rp95, rp99 := percentiles(r.readLat)
+	fmt.Printf("\n--- REPLAY size=%s count=%d ack-every=%d ---\n",
+		humanBytes(int64(r.cfg.payloadSize)), r.totalRead, r.cfg.ackEvery)
+	fmt.Printf("drained:       %d records in %s\n", r.totalRead, r.elapsed)
+	fmt.Printf("rate:          %s rec/s   (%.2f MB/s)\n", commaSep(int64(rate)), mb)
+	fmt.Printf("Next() latency: p50=%s  p95=%s  p99=%s\n", humanDur(rp50), humanDur(rp95), humanDur(rp99))
 	fmt.Printf("disk:          %s across %d closed segments\n", humanBytes(r.bytesOnDisk), r.rotations)
 }
 
