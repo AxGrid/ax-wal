@@ -44,10 +44,14 @@ type cursorState struct {
 	mu  sync.Mutex
 	rec cursorRecord
 
-	// hbIndex is the most recent index visible to the heartbeat goroutine when
-	// it wakes up — set by Ack so the heartbeat can persist it without going
-	// through the main mutex.
+	// hbIndex is the most recent index seen by Ack(). The heartbeat / batch-ack
+	// goroutine periodically reads this and persists it.
 	hbIndex atomic.Uint64
+
+	// batchAck, when true, makes Ack() update hbIndex only (no fsync). The
+	// heartbeat goroutine fsyncs at its own cadence. Trade-off: up to
+	// HeartbeatInterval of records may be re-delivered after a reader crash.
+	batchAck bool
 
 	stop chan struct{}
 	wg   sync.WaitGroup
@@ -146,15 +150,26 @@ func (cs *cursorState) heartbeatLoop(interval time.Duration) {
 	}
 }
 
-// Ack persists index as the new acknowledged position with fsync. After return,
-// the index is durably saved.
+// Ack persists index as the new acknowledged position. When batchAck is set,
+// the persist+fsync is deferred to the heartbeat goroutine; otherwise this
+// call returns only after the index is durably saved.
 func (cs *cursorState) Ack(index uint64) error {
+	if cs.batchAck {
+		// Lock-free fast path: update hbIndex monotonically.
+		for {
+			cur := cs.hbIndex.Load()
+			if index < cur {
+				return fmt.Errorf("axwal: cursor %s ack %d < current %d", cs.name, index, cur)
+			}
+			if cs.hbIndex.CompareAndSwap(cur, index) {
+				return nil
+			}
+		}
+	}
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
 	rec := cs.rec
 	if index < rec.Index {
-		// Refusing to go backwards prevents accidental "redelivery loops" if
-		// callers pass stale indices.
 		return fmt.Errorf("axwal: cursor %s ack %d < current %d", cs.name, index, rec.Index)
 	}
 	rec.Index = index
@@ -207,6 +222,18 @@ func (cs *cursorState) Close() error {
 		cs.wg.Wait()
 		cs.stop = nil
 	}
+	// Final flush so a batched-ack reader doesn't lose the most recently Ack'd
+	// index on a clean shutdown.
+	cs.mu.Lock()
+	if cs.hbIndex.Load() > cs.rec.Index {
+		rec := cs.rec
+		rec.Index = cs.hbIndex.Load()
+		rec.LastHeartbeatUnix = time.Now().Unix()
+		if err := cs.persist(rec); err == nil {
+			cs.rec = rec
+		}
+	}
+	cs.mu.Unlock()
 	return cs.releaseLock()
 }
 

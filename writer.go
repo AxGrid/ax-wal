@@ -31,6 +31,10 @@ type WriterOptions struct {
 	// CompressOnRotate toggles async zstd compression of rotated segments.
 	CompressOnRotate bool
 
+	// SyncMode selects the durability strategy on each commit window. See
+	// SyncMode constants for the trade-offs. Defaults to SyncFull.
+	SyncMode SyncMode
+
 	// BufferSize is the bufio.Writer size for the active segment. Defaults to 64 KiB.
 	BufferSize int
 
@@ -42,6 +46,49 @@ type WriterOptions struct {
 
 	// Retention controls cursor-aware automatic deletion of old segments.
 	Retention RetentionConfig
+}
+
+// SyncMode controls how aggressively the writer pushes data to stable storage.
+type SyncMode int
+
+const (
+	// SyncFull (default) — call *os.File.Sync() after every commit window.
+	// On macOS this internally invokes F_FULLFSYNC, which waits for the SSD
+	// firmware to flush its DRAM cache; safest, but ~5-15ms per call.
+	// On Linux this is fsync(2): waits for data + size metadata to reach disk.
+	// Choose for: financial / regulatory systems, anything that must survive
+	// hard power loss without losing a single Acked record.
+	SyncFull SyncMode = iota
+
+	// SyncBarrier — barrier-only durability.
+	//   macOS: F_BARRIERFSYNC (orders writes; doesn't wait for flush-to-platter)
+	//   Linux: fdatasync(2)  (skips metadata that doesn't affect read consistency)
+	// Records reach the OS page cache and are ordered, but a sudden power loss
+	// can lose the last hundreds-of-ms of writes. Throughput often 5-30× higher
+	// than SyncFull. Good for: queues backed by UPS / cloud SSDs / replicated
+	// storage where the OS surviving the failure is enough.
+	SyncBarrier
+
+	// SyncNone — never call any flush; let the kernel decide. The write is
+	// visible to other processes on this host immediately, but a hard crash or
+	// power loss can lose seconds of data.
+	// Good for: metric pipelines, observability event streams, any case where
+	// the producer is the source of truth and downstream is reconstructable.
+	SyncNone
+)
+
+// String returns the SyncMode in human-readable form.
+func (m SyncMode) String() string {
+	switch m {
+	case SyncFull:
+		return "full"
+	case SyncBarrier:
+		return "barrier"
+	case SyncNone:
+		return "none"
+	default:
+		return "unknown"
+	}
 }
 
 // GroupCommitConfig controls batched fsync.
@@ -313,11 +360,23 @@ func (w *Writer) flushAndSyncLocked() error {
 	if err := w.buf.Flush(); err != nil {
 		return fmt.Errorf("flush: %w", err)
 	}
-	if err := w.file.Sync(); err != nil {
-		return fmt.Errorf("fsync: %w", err)
+	if err := w.syncFile(w.file); err != nil {
+		return fmt.Errorf("sync: %w", err)
 	}
 	w.pendingBytes = 0
 	return nil
+}
+
+// syncFile applies the configured SyncMode.
+func (w *Writer) syncFile(f *os.File) error {
+	switch w.opts.SyncMode {
+	case SyncNone:
+		return nil
+	case SyncBarrier:
+		return syncBarrier(f)
+	default: // SyncFull
+		return f.Sync()
+	}
 }
 
 func (w *Writer) kickCommit() {
@@ -407,6 +466,9 @@ func (w *Writer) Close() error {
 		if err := w.buf.Flush(); err != nil && firstErr == nil {
 			firstErr = err
 		}
+		// On clean close we ALWAYS do a full Sync, regardless of SyncMode.
+		// The user opted into SyncBarrier/SyncNone for steady-state throughput;
+		// on shutdown we want the segment durably committed.
 		if err := w.file.Sync(); err != nil && firstErr == nil {
 			firstErr = err
 		}
@@ -461,8 +523,9 @@ func (w *Writer) Close() error {
 	return firstErr
 }
 
-// Sync forces an additional fsync of the current segment file (already done per Append,
-// but exposed for parity / explicit checkpoints).
+// Sync forces a full fsync of the current segment file. Use this as an
+// explicit checkpoint when SyncMode is Barrier or None — it bypasses the
+// configured mode and guarantees a hard flush.
 func (w *Writer) Sync() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()

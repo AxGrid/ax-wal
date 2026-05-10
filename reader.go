@@ -50,6 +50,19 @@ type ReaderOptions struct {
 	// Should be < writer's StaleReaderTTL/2. Defaults to 5s.
 	HeartbeatInterval time.Duration
 
+	// AckBatchInterval, when > 0, switches Ack() into batched mode: Ack()
+	// updates the in-memory cursor immediately but defers the fsync to a
+	// background goroutine that flushes every AckBatchInterval. This typically
+	// raises read throughput by 1-3 orders of magnitude.
+	//
+	// Trade-off: after a reader crash or hard kill, up to AckBatchInterval's
+	// worth of records may be re-delivered (at-least-once still holds, but the
+	// "least" gets larger).
+	//
+	// On clean Close() the latest Ack is flushed so no progress is lost.
+	// When 0 (default), Ack() fsyncs immediately.
+	AckBatchInterval time.Duration
+
 	// PollInterval is the fallback wakeup interval when fsnotify isn't usable
 	// or just to bound latency. Defaults to 100ms.
 	PollInterval time.Duration
@@ -97,6 +110,15 @@ func OpenReader(opts ReaderOptions) (*Reader, error) {
 	cs, err := openCursor(opts.Dir, opts.Name)
 	if err != nil {
 		return nil, err
+	}
+
+	// Wire up batched-ack mode and possibly tighten the heartbeat tick so the
+	// cursor doesn't drift further behind than the user asked.
+	if opts.AckBatchInterval > 0 {
+		cs.batchAck = true
+		if opts.AckBatchInterval < opts.HeartbeatInterval {
+			opts.HeartbeatInterval = opts.AckBatchInterval
+		}
 	}
 
 	r := &Reader{

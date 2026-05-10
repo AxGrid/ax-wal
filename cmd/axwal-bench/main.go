@@ -43,7 +43,9 @@ type runConfig struct {
 	maxSegmentSize   int64
 	maxSegmentRecs   uint64
 	requireArchived  bool
-	ackEvery         uint64 // call Ack only every N records (1 = per record)
+	ackEvery         uint64        // call Ack only every N records (1 = per record)
+	ackBatch         time.Duration // ReaderOptions.AckBatchInterval
+	syncMode         axwal.SyncMode
 }
 
 type result struct {
@@ -70,8 +72,22 @@ func main() {
 	maxSegRecs := flag.Uint64("max-segment-records", 0, "max records per segment (0=disabled)")
 	requireArchived := flag.Bool("require-archived", false, "block deletion until .archived sidecar present")
 	ackEvery := flag.Uint64("ack-every", 1, "Ack the cursor only every N records (1 = strict at-least-once, higher = faster reads at risk of replay window)")
+	ackBatch := flag.Duration("ack-batch", 0, "ReaderOptions.AckBatchInterval (0=disabled, e.g. 10ms)")
+	syncMode := flag.String("sync-mode", "full", "writer durability: full | barrier | none")
 	replayCount := flag.Uint64("replay-count", 0, "REPLAY MODE: pre-populate this many records, then time a fresh reader draining them all (no concurrent writer)")
 	flag.Parse()
+
+	var sm axwal.SyncMode
+	switch *syncMode {
+	case "full":
+		sm = axwal.SyncFull
+	case "barrier":
+		sm = axwal.SyncBarrier
+	case "none":
+		sm = axwal.SyncNone
+	default:
+		log.Fatalf("invalid -sync-mode %q (full|barrier|none)", *syncMode)
+	}
 
 	if *size < headerSize {
 		log.Fatalf("payload size must be >= %d to fit header", headerSize)
@@ -106,6 +122,8 @@ func main() {
 			maxSegmentRecs:  *maxSegRecs,
 			requireArchived: *requireArchived,
 			ackEvery:        *ackEvery,
+			ackBatch:        *ackBatch,
+			syncMode:        sm,
 		}
 		var r result
 		if *replayCount > 0 {
@@ -134,6 +152,7 @@ func runOne(cfg runConfig) result {
 		MaxSegmentSize:    cfg.maxSegmentSize,
 		MaxSegmentRecords: cfg.maxSegmentRecs,
 		CompressOnRotate:  cfg.compress,
+		SyncMode:          cfg.syncMode,
 		GroupCommit: axwal.GroupCommitConfig{
 			Enabled:    cfg.groupCommit,
 			MaxLatency: cfg.gcLatency,
@@ -154,6 +173,7 @@ func runOne(cfg runConfig) result {
 		Name:              "bench",
 		StartFrom:         axwal.StartEarliest,
 		HeartbeatInterval: time.Second,
+		AckBatchInterval:  cfg.ackBatch,
 		PollInterval:      5 * time.Millisecond,
 	})
 	if err != nil {
@@ -328,6 +348,7 @@ func runReplay(cfg runConfig, count uint64) result {
 		Dir:              cfg.dir,
 		MaxSegmentSize:   cfg.maxSegmentSize,
 		CompressOnRotate: cfg.compress,
+		SyncMode:         cfg.syncMode,
 		// No group commit for the prepopulate phase: we're doing one big
 		// AppendBatch, which is already a single fsync.
 	})
@@ -372,6 +393,7 @@ func runReplay(cfg runConfig, count uint64) result {
 		Name:              "replay",
 		StartFrom:         axwal.StartEarliest,
 		HeartbeatInterval: time.Second,
+		AckBatchInterval:  cfg.ackBatch,
 		PollInterval:      5 * time.Millisecond,
 	})
 	if err != nil {
