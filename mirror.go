@@ -11,14 +11,24 @@ const defaultMirrorAckBatch = 100 * time.Millisecond
 
 // MirrorOptions configures a Mirror session: read from a source WAL, append to
 // a destination WAL.
+//
+// Source can be local (SrcDir set) or remote (SrcRemote set, in which case
+// the mirror dials axwal-serve via TCP, optionally through an in-process SSH
+// tunnel — see RemoteReaderOptions and SSHTunnelConfig).
 type MirrorOptions struct {
-	// SrcDir / DstDir are the source and destination WAL directories. They
-	// must NOT be the same directory.
+	// SrcDir is the local source WAL directory. Mutually exclusive with
+	// SrcRemote.
 	SrcDir string
+
+	// SrcRemote, when non-nil, makes the mirror pull records from a remote
+	// axwal-serve over the wire protocol. SrcRemote.Name overrides Name below.
+	SrcRemote *RemoteReaderOptions
+
+	// DstDir is the destination WAL directory. Required.
 	DstDir string
 
-	// Name is the cursor name registered in the SOURCE WAL. Use a stable name
-	// so the mirror resumes after restart from the last fully-mirrored index.
+	// Name is the cursor name registered in the local SOURCE WAL. Ignored when
+	// SrcRemote is set (server tracks the cursor under SrcRemote.Name).
 	Name string
 
 	// StartFrom controls where the mirror begins on first registration. After
@@ -35,10 +45,18 @@ type MirrorOptions struct {
 	// honored.
 	DstWriterOptions WriterOptions
 
-	// SrcReaderOptions is applied to the source Reader. Dir/Name/StartFrom are
-	// overridden; the rest (Logger, UseMmap, Encryption…) is honored. In
-	// particular set Encryption here if the source is encrypted.
+	// SrcReaderOptions is applied to the local source Reader (when SrcDir is
+	// used). Dir/Name/StartFrom are overridden; the rest (Logger, UseMmap,
+	// Encryption…) is honored.
 	SrcReaderOptions ReaderOptions
+}
+
+// recordSource is the small surface Mirror needs from its source. Both Reader
+// and RemoteReader satisfy it.
+type recordSource interface {
+	NextBatch(ctx context.Context, max int) ([][]byte, []uint64, error)
+	Ack(idx uint64) error
+	Close() error
 }
 
 // Mirror copies records from SrcDir to DstDir until ctx is canceled. Indices
@@ -48,36 +66,50 @@ type MirrorOptions struct {
 // Designed for follower setups: run under systemd / k8s, point at a primary
 // WAL on shared storage, get a hot standby that's queryable as a normal WAL.
 func Mirror(ctx context.Context, opts MirrorOptions) (int64, error) {
-	if opts.SrcDir == "" || opts.DstDir == "" {
-		return 0, errors.New("axwal: Mirror requires SrcDir and DstDir")
+	if opts.DstDir == "" {
+		return 0, errors.New("axwal: Mirror.DstDir required")
 	}
-	if opts.SrcDir == opts.DstDir {
+	if (opts.SrcDir == "") == (opts.SrcRemote == nil) {
+		return 0, errors.New("axwal: Mirror requires exactly one of SrcDir or SrcRemote")
+	}
+	if opts.SrcDir != "" && opts.SrcDir == opts.DstDir {
 		return 0, errors.New("axwal: Mirror SrcDir and DstDir must differ")
-	}
-	if opts.Name == "" {
-		return 0, errors.New("axwal: Mirror.Name is required")
 	}
 	batch := opts.BatchSize
 	if batch <= 0 {
 		batch = 256
 	}
 
-	rOpts := opts.SrcReaderOptions
-	rOpts.Dir = opts.SrcDir
-	rOpts.Name = opts.Name
-	rOpts.StartFrom = opts.StartFrom
-	rOpts.StartAtIndex = opts.StartAtIndex
-	if rOpts.AckBatchInterval == 0 {
-		// Sensible default: cursor fsync once per 100ms keeps mirror progress
-		// up-to-date without bottlenecking on per-record fsyncs.
-		rOpts.AckBatchInterval = defaultMirrorAckBatch
+	var src recordSource
+	if opts.SrcRemote != nil {
+		ro := *opts.SrcRemote
+		if ro.BatchSize <= 0 {
+			ro.BatchSize = batch
+		}
+		rr, err := DialRemoteReader(ctx, ro)
+		if err != nil {
+			return 0, fmt.Errorf("mirror: dial remote: %w", err)
+		}
+		src = rr
+	} else {
+		if opts.Name == "" {
+			return 0, errors.New("axwal: Mirror.Name required for local source")
+		}
+		rOpts := opts.SrcReaderOptions
+		rOpts.Dir = opts.SrcDir
+		rOpts.Name = opts.Name
+		rOpts.StartFrom = opts.StartFrom
+		rOpts.StartAtIndex = opts.StartAtIndex
+		if rOpts.AckBatchInterval == 0 {
+			rOpts.AckBatchInterval = defaultMirrorAckBatch
+		}
+		r, err := OpenReader(rOpts)
+		if err != nil {
+			return 0, fmt.Errorf("mirror: open source reader: %w", err)
+		}
+		src = r
 	}
-
-	r, err := OpenReader(rOpts)
-	if err != nil {
-		return 0, fmt.Errorf("mirror: open source reader: %w", err)
-	}
-	defer r.Close()
+	defer src.Close()
 
 	wOpts := opts.DstWriterOptions
 	wOpts.Dir = opts.DstDir
@@ -92,7 +124,7 @@ func Mirror(ctx context.Context, opts MirrorOptions) (int64, error) {
 		if err := ctx.Err(); err != nil {
 			return mirrored, nil
 		}
-		payloads, indices, err := r.NextBatch(ctx, batch)
+		payloads, indices, err := src.NextBatch(ctx, batch)
 		if err != nil {
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				return mirrored, nil
@@ -108,9 +140,7 @@ func Mirror(ctx context.Context, opts MirrorOptions) (int64, error) {
 			}
 			return mirrored, fmt.Errorf("mirror: write: %w", err)
 		}
-		// Ack after the destination has fsynced (AppendBatchContext returns
-		// only after durability — see GroupCommit/SyncMode).
-		if err := r.Ack(indices[len(indices)-1]); err != nil {
+		if err := src.Ack(indices[len(indices)-1]); err != nil {
 			return mirrored, fmt.Errorf("mirror: ack: %w", err)
 		}
 		mirrored += int64(len(payloads))

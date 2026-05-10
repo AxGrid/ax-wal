@@ -280,6 +280,10 @@ or after pulling a backup.
 
 ### Replication / Mirror
 
+Three deployment patterns, same Mirror primitive in all of them:
+
+**(1) Local: both directories visible from one process**
+
 ```go
 axwal.Mirror(ctx, axwal.MirrorOptions{
     SrcDir: "/shared/leader-wal",
@@ -289,17 +293,95 @@ axwal.Mirror(ctx, axwal.MirrorOptions{
 })
 ```
 
-Pull-based replication: opens a Reader on src + Writer on dst, copies
-records in NextBatch chunks, advances src cursor after dst confirms
-durability. Survives src restarts (cursor persists). Run as a foreground
-process under systemd:
-
-```
+```bash
 axwal-mirror -src /shared/leader -dst /local/follower -name follower-1
 ```
 
+**(2) Remote: TCP between two hosts**
+
+On the primary:
+
+```bash
+axwal-serve -dir /var/wal -listen 127.0.0.1:9001
+```
+
+On the follower:
+
+```bash
+axwal-mirror -addr primary.local:9001 -dst /local/follower -name follower-1
+```
+
+The server itself is plain TCP — bind it to a private interface or
+firewall the port. For exposed deployments, use pattern (3).
+
+**(3) Remote with in-process SSH tunnel (recommended for production)**
+
+`axwal-mirror` dials SSH itself; no external `ssh -L` process required.
+The TCP socket between the two ax-wal processes never leaves localhost on
+either side.
+
+```bash
+# Primary listens on 127.0.0.1 only — outsiders cannot reach the WAL
+# without first authenticating to SSH on the same host.
+axwal-serve -dir /var/wal -listen 127.0.0.1:9001
+```
+
+```bash
+# Follower
+axwal-mirror \
+  -tunnel root@primary.example.com:22 \
+  -ssh-agent                              \  # or -ssh-key ~/.ssh/id_ed25519
+  -ssh-known-hosts ~/.ssh/known_hosts     \  # strict host-key verification
+  -addr 127.0.0.1:9001                    \  # as seen from inside the SSH host
+  -dst /local/follower                    \
+  -name follower-1
+```
+
+Library equivalent:
+
+```go
+axwal.Mirror(ctx, axwal.MirrorOptions{
+    SrcRemote: &axwal.RemoteReaderOptions{
+        Addr: "127.0.0.1:9001",
+        Name: "follower-1",
+        SSHTunnel: &axwal.SSHTunnelConfig{
+            Host:           "primary.example.com:22",
+            User:           "root",
+            KeyFile:        "/home/follower/.ssh/id_ed25519",
+            KnownHostsFile: "/home/follower/.ssh/known_hosts",
+        },
+    },
+    DstDir:    "/local/follower",
+    BatchSize: 256,
+})
+```
+
+Why this design:
+
+- **No PKI needed.** SSH keys + known_hosts are already managed on every
+  host with sshd. No certificate authority, no rotation tooling.
+- **Confidentiality + integrity + authentication**, all from SSH.
+- **Operational visibility**: connections show up in `sshd` audit logs.
+- **Fits into existing firewalls**: only port 22 needs to be open; the
+  WAL port stays on localhost.
+
+Wire protocol:
+
+```
+HELLO  (client → server)   {name, start_index, batch_size} as JSON
+OK     (server → client)   8B head_index
+ERR    (server → client)   {error} as JSON
+RECBATCH  (server → client) packed [index|len|payload] tuples
+PING   (server → client)   keepalive on idle
+ACK    (client → server)   8B last_received_index, periodic
+```
+
+No protobuf, no schema compiler — readable in a hex dump. See `wire.go`.
+
 Indices align iff dst started fresh. For HA you can encrypt+mirror across
-trust zones via `-src-key-file` / `-dst-key-file`.
+trust zones via `-src-key-file` / `-dst-key-file`. The follower can be
+queried as a normal local WAL — readers register cursors as usual; the
+mirror process is the only writer.
 
 ## Benchmarks
 
@@ -387,9 +469,17 @@ go run ./cmd/axwal-bench -duration 10s -writers 4 -size 1024 \
 go run ./cmd/axwal-bench -suite -duration 5s -writers 4   # 100B..1MB
 go run ./cmd/axwal-bench -dir /tmp/q -size 1024 -replay-count 100000
 
-# Replication
+# Replication — local (both dirs accessible)
 go run ./cmd/axwal-mirror -src /shared/leader -dst /local/follower \
     -name follower-1 -batch 256
+
+# Replication — over the network (primary)
+go run ./cmd/axwal-serve -dir /var/wal -listen 127.0.0.1:9001
+
+# Replication — over the network (follower) via SSH tunnel
+go run ./cmd/axwal-mirror -tunnel root@primary:22 -ssh-agent \
+    -ssh-known-hosts ~/.ssh/known_hosts \
+    -addr 127.0.0.1:9001 -dst /local/follower -name follower-1
 
 # Admin
 go run ./cmd/axwal-cli ls -dir /tmp/wal
