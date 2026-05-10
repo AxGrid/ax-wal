@@ -336,6 +336,22 @@ func walkSegment(path string) (int, error) {
 	}
 }
 
+// loadKeyFile returns the EncryptionConfig for the given keyFile path, or nil
+// if keyFile is empty. The file must contain exactly 32 raw bytes.
+func loadKeyFile(keyFile string) *axwal.EncryptionConfig {
+	if keyFile == "" {
+		return nil
+	}
+	b, err := os.ReadFile(keyFile)
+	if err != nil {
+		fatal("read key file: %v", err)
+	}
+	if len(b) != 32 {
+		fatal("key file must be exactly 32 bytes, got %d", len(b))
+	}
+	return &axwal.EncryptionConfig{Key: b}
+}
+
 // ---------------- tail ----------------
 
 func cmdTail(args []string) {
@@ -344,6 +360,7 @@ func cmdTail(args []string) {
 	name := fs.String("name", fmt.Sprintf("axwal-cli-tail-%d", os.Getpid()), "cursor name (temporary)")
 	from := fs.String("from", "earliest", "earliest | latest | <index>")
 	hex := fs.Bool("hex", false, "print payload as hex instead of string")
+	keyFile := fs.String("key-file", "", "32-byte AES key file (required for encrypted WALs)")
 	fs.Parse(args)
 	if *dir == "" {
 		fatal("tail: -dir required")
@@ -354,6 +371,7 @@ func cmdTail(args []string) {
 		Name:              *name,
 		HeartbeatInterval: time.Second,
 		PollInterval:      50 * time.Millisecond,
+		Encryption:        loadKeyFile(*keyFile),
 	}
 	switch *from {
 	case "earliest":
@@ -545,6 +563,7 @@ func cmdDump(args []string) {
 	dir := fs.String("dir", "", "WAL directory")
 	from := fs.Uint64("from", 0, "first index to dump (inclusive). 0=earliest")
 	to := fs.Uint64("to", 0, "last index to dump (inclusive). 0=read until ctx-stop")
+	keyFile := fs.String("key-file", "", "32-byte AES key file (required for encrypted WALs)")
 	fs.Parse(args)
 	if *dir == "" {
 		fatal("dump: -dir required")
@@ -555,6 +574,7 @@ func cmdDump(args []string) {
 		Name:              fmt.Sprintf("axwal-cli-dump-%d", os.Getpid()),
 		HeartbeatInterval: time.Second,
 		PollInterval:      50 * time.Millisecond,
+		Encryption:        loadKeyFile(*keyFile),
 	}
 	if *from == 0 {
 		opts.StartFrom = axwal.StartEarliest
@@ -597,12 +617,13 @@ func cmdRestore(args []string) {
 	fs := flag.NewFlagSet("restore", flag.ExitOnError)
 	dir := fs.String("dir", "", "TARGET WAL directory (writer will append here)")
 	src := fs.String("src", "", "JSON dump file (one record per line, format: {idx, len, payload})")
+	keyFile := fs.String("key-file", "", "32-byte AES key for the TARGET (target writer encrypts records)")
 	fs.Parse(args)
 	if *dir == "" || *src == "" {
 		fatal("restore: -dir and -src required")
 	}
 
-	w, err := axwal.OpenWriter(axwal.WriterOptions{Dir: *dir})
+	w, err := axwal.OpenWriter(axwal.WriterOptions{Dir: *dir, Encryption: loadKeyFile(*keyFile)})
 	if err != nil {
 		fatal("open writer: %v", err)
 	}

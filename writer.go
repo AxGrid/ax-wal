@@ -3,8 +3,10 @@ package axwal
 import (
 	"bufio"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -82,6 +84,10 @@ type WriterOptions struct {
 
 	// BufferSize is the bufio.Writer size for the active segment. Defaults to 64 KiB.
 	BufferSize int
+
+	// Encryption, if non-nil, seals every record's payload with AES-256-GCM
+	// before it hits disk. Readers must use the same key. See EncryptionConfig.
+	Encryption *EncryptionConfig
 
 	// Logger receives all package-internal log events. Defaults to
 	// slog.Default(). Use this to route axwal logs through your central
@@ -257,10 +263,11 @@ type writerCounters struct {
 
 // Writer is the single-process append side of the WAL.
 type Writer struct {
-	opts WriterOptions
-	dir  string
-	lock *writerLock
-	log  *slog.Logger
+	opts   WriterOptions
+	dir    string
+	lock   *writerLock
+	log    *slog.Logger
+	cipher *cipherAEAD // non-nil iff opts.Encryption is set
 
 	// ctx is canceled by Close so that infinite retry loops in the rotation /
 	// compression goroutines exit cleanly. Background work that observes
@@ -341,12 +348,23 @@ func OpenWriter(opts WriterOptions) (*Writer, error) {
 		return nil, err
 	}
 
+	var cipherInst *cipherAEAD
+	if opts.Encryption != nil {
+		c, err := newCipher(opts.Encryption.Key)
+		if err != nil {
+			_ = lock.Release()
+			return nil, err
+		}
+		cipherInst = c
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	w := &Writer{
 		opts:      opts,
 		dir:       opts.Dir,
 		lock:      lock,
 		log:       logger,
+		cipher:    cipherInst,
 		ctx:       ctx,
 		ctxCancel: cancel,
 	}
@@ -474,15 +492,30 @@ func (w *Writer) AppendBatchContext(ctx context.Context, records [][]byte) ([]ui
 		return nil, errors.New("axwal: writer closed")
 	}
 
-	frames := make([][]byte, len(records))
-	var totalSize int64
-	for i, r := range records {
-		f, err := encodeRecord(r)
-		if err != nil {
-			return nil, err
+	// If encryption is enabled, seal every payload now. We materialize a new
+	// slice because the original `records` are user-owned and we don't want
+	// to mutate them; the sealed slice goes through the rest of the path
+	// transparently.
+	if w.cipher != nil {
+		sealed := make([][]byte, len(records))
+		for i, r := range records {
+			ct, err := w.cipher.seal(r)
+			if err != nil {
+				return nil, err
+			}
+			sealed[i] = ct
 		}
-		frames[i] = f
-		totalSize += int64(len(f))
+		records = sealed
+	}
+
+	// Compute total frame bytes without allocating per-record buffers; we'll
+	// stream each record into bufio directly below.
+	var totalSize int64
+	for _, r := range records {
+		if len(r) > maxRecordSize {
+			return nil, fmt.Errorf("%w: record %d exceeds %d", ErrRecordTooLarge, len(r), maxRecordSize)
+		}
+		totalSize += int64(headerSize + len(r))
 	}
 
 	// Backpressure: refuse the write before we've appended anything if it
@@ -501,14 +534,15 @@ func (w *Writer) AppendBatchContext(ctx context.Context, records [][]byte) ([]ui
 	}
 
 	idxs := make([]uint64, len(records))
-	for i, f := range frames {
-		if _, err := w.buf.Write(f); err != nil {
-			return nil, fmt.Errorf("buffer write: %w", err)
+	for i, r := range records {
+		if err := w.writeFrameLocked(r); err != nil {
+			return nil, err
 		}
 		w.lastIndex++
-		w.curSize += int64(len(f))
+		frameSize := int64(headerSize + len(r))
+		w.curSize += frameSize
 		w.curRecords++
-		w.pendingBytes += len(f)
+		w.pendingBytes += int(frameSize)
 		idxs[i] = w.lastIndex
 	}
 	myMaxIdx := idxs[len(idxs)-1]
@@ -569,6 +603,22 @@ func (w *Writer) AppendBatchContext(ctx context.Context, records [][]byte) ([]ui
 	}
 	w.commitIndex = w.lastIndex
 	return idxs, nil
+}
+
+// writeFrameLocked emits a complete frame [u32 len | u32 crc32c | payload]
+// directly to the bufio buffer without allocating any intermediate slice.
+// Caller holds w.mu.
+func (w *Writer) writeFrameLocked(payload []byte) error {
+	var hdr [headerSize]byte
+	binary.BigEndian.PutUint32(hdr[0:4], uint32(len(payload)))
+	binary.BigEndian.PutUint32(hdr[4:8], crc32.Checksum(payload, crcTable))
+	if _, err := w.buf.Write(hdr[:]); err != nil {
+		return fmt.Errorf("buffer write header: %w", err)
+	}
+	if _, err := w.buf.Write(payload); err != nil {
+		return fmt.Errorf("buffer write payload: %w", err)
+	}
+	return nil
 }
 
 // shouldRotateBeforeWriteLocked returns true if appending `addBytes` more bytes

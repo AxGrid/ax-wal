@@ -2,6 +2,7 @@ package axwal
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -68,6 +69,18 @@ type ReaderOptions struct {
 	// or just to bound latency. Defaults to 100ms.
 	PollInterval time.Duration
 
+	// Encryption, if non-nil, opens records sealed by a writer with the same
+	// key. Mismatch returns ErrEncryption from Next/NextBatch.
+	Encryption *EncryptionConfig
+
+	// UseMmap, when true, memory-maps closed uncompressed segments instead of
+	// reading them through bufio. Faster on huge cold-replay scans (multi-GB
+	// segments) because parsing happens out of the page cache directly. Has
+	// no effect on the active open segment (file size grows) or on .zst
+	// segments (decoder needs a streaming reader). Cleanup is automatic on
+	// segment switch / Close.
+	UseMmap bool
+
 	// Logger receives reader-side log events. Defaults to slog.Default().
 	Logger *slog.Logger
 }
@@ -86,11 +99,12 @@ type ReaderStats struct {
 
 // Reader is a tail-and-follow consumer of a WAL.
 type Reader struct {
-	dir   string
-	opts  ReaderOptions
-	cur   *cursorState
-	notif *notifier
-	log   *slog.Logger
+	dir    string
+	opts   ReaderOptions
+	cur    *cursorState
+	notif  *notifier
+	log    *slog.Logger
+	cipher *cipherAEAD
 
 	cnt readerCounters
 
@@ -110,6 +124,7 @@ type Reader struct {
 	file    *os.File
 	br      *bufio.Reader
 	zstd    *zstd.Decoder
+	mmap    []byte // non-nil iff segment is mmap'd
 }
 
 type readerCounters struct {
@@ -140,6 +155,15 @@ func OpenReader(opts ReaderOptions) (*Reader, error) {
 	}
 	logger := opts.Logger.With("component", "axwal.reader", "dir", opts.Dir, "name", opts.Name)
 
+	var cipherInst *cipherAEAD
+	if opts.Encryption != nil {
+		c, err := newCipher(opts.Encryption.Key)
+		if err != nil {
+			return nil, err
+		}
+		cipherInst = c
+	}
+
 	cs, err := openCursor(opts.Dir, opts.Name)
 	if err != nil {
 		return nil, err
@@ -155,10 +179,11 @@ func OpenReader(opts ReaderOptions) (*Reader, error) {
 	}
 
 	r := &Reader{
-		dir:  opts.Dir,
-		opts: opts,
-		cur:  cs,
-		log:  logger,
+		dir:    opts.Dir,
+		opts:   opts,
+		cur:    cs,
+		log:    logger,
+		cipher: cipherInst,
 	}
 
 	// Determine starting index.
@@ -308,6 +333,13 @@ func (r *Reader) Next(ctx context.Context) ([]byte, uint64, error) {
 		case err == nil:
 			idx := r.nextIdx.Load()
 			r.nextIdx.Store(idx + 1)
+			if r.cipher != nil {
+				pt, derr := r.cipher.open(payload)
+				if derr != nil {
+					return nil, idx, derr
+				}
+				payload = pt
+			}
 			return payload, idx, nil
 
 		case errors.Is(err, io.EOF):
@@ -396,6 +428,13 @@ func (r *Reader) NextBatch(ctx context.Context, max int) (payloads [][]byte, ind
 		nextIdx := r.nextIdx.Load()
 		r.nextIdx.Store(nextIdx + 1)
 		r.cnt.nextCalls.Add(1)
+		if r.cipher != nil {
+			pt, derr := r.cipher.open(payload)
+			if derr != nil {
+				return payloads, indices, derr
+			}
+			payload = pt
+		}
 		payloads = append(payloads, payload)
 		indices = append(indices, nextIdx)
 	}
@@ -443,6 +482,10 @@ func (r *Reader) closeCurrentFile() {
 		r.zstd.Close()
 		r.zstd = nil
 	}
+	if r.mmap != nil {
+		_ = munmap(r.mmap)
+		r.mmap = nil
+	}
 	if r.file != nil {
 		_ = r.file.Close()
 		r.file = nil
@@ -488,7 +531,9 @@ func (r *Reader) openSegment(s segName) error {
 	}
 
 	var src io.Reader = f
-	if s.Compression == "zst" {
+	r.segCompressed = s.Compression == "zst"
+
+	if r.segCompressed {
 		dec, err := zstd.NewReader(f)
 		if err != nil {
 			f.Close()
@@ -496,7 +541,18 @@ func (r *Reader) openSegment(s segName) error {
 		}
 		r.zstd = dec
 		src = dec
-		r.segCompressed = true
+	} else if r.opts.UseMmap && s.Closed {
+		// mmap the closed uncompressed segment for parse-from-page-cache speed.
+		fi, statErr := f.Stat()
+		if statErr == nil && fi.Size() > 0 {
+			data, mmapErr := mmapReadOnly(f, fi.Size())
+			if mmapErr == nil {
+				r.mmap = data
+				src = bytes.NewReader(data)
+			} else {
+				r.log.Warn("mmap failed; falling back to bufio", "name", s.Name, "err", mmapErr)
+			}
+		}
 	}
 
 	r.file = f

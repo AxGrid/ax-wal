@@ -797,6 +797,168 @@ func TestRetention_MaxRetainAge(t *testing.T) {
 	}, 1*time.Second, 50*time.Millisecond, "age-based retention should have purged old closed segments")
 }
 
+func TestMirror_BasicReplication(t *testing.T) {
+	src := t.TempDir()
+	dst := t.TempDir()
+
+	w, err := OpenWriter(WriterOptions{Dir: src, MaxSegmentSize: 1 << 20})
+	require.NoError(t, err)
+	for i := 0; i < 100; i++ {
+		_, err := w.Append([]byte(fmt.Sprintf("v-%03d", i)))
+		require.NoError(t, err)
+	}
+	require.NoError(t, w.Close())
+
+	// Run mirror until the destination has caught up.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	mirrorDone := make(chan int64, 1)
+	mirrorErr := make(chan error, 1)
+	go func() {
+		count, err := Mirror(ctx, MirrorOptions{
+			SrcDir:    src,
+			DstDir:    dst,
+			Name:      "mirror-test",
+			StartFrom: StartEarliest,
+			BatchSize: 32,
+		})
+		mirrorDone <- count
+		mirrorErr <- err
+	}()
+
+	// Poll until dst has all 100 records, then cancel.
+	require.Eventually(t, func() bool {
+		w2, err := OpenWriter(WriterOptions{Dir: dst})
+		if err != nil {
+			// dst is locked by the mirror — check by opening a reader instead
+			r, err := OpenReader(ReaderOptions{Dir: dst, Name: "watcher-" + fmt.Sprint(time.Now().UnixNano()), StartFrom: StartLatest})
+			if err != nil {
+				return false
+			}
+			head, _ := r.HeadIndex()
+			r.Close()
+			return head == 100
+		}
+		head := w2.LastIndex()
+		w2.Close()
+		return head == 100
+	}, 4*time.Second, 100*time.Millisecond)
+
+	cancel()
+	count := <-mirrorDone
+	err = <-mirrorErr
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, count, int64(100))
+
+	// Read back from dst — every record should match.
+	r, err := OpenReader(ReaderOptions{Dir: dst, Name: "verify", StartFrom: StartEarliest})
+	require.NoError(t, err)
+	defer r.Close()
+	verifyCtx, vcancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer vcancel()
+	for i := 0; i < 100; i++ {
+		payload, idx, err := r.Next(verifyCtx)
+		require.NoError(t, err)
+		require.Equal(t, uint64(i+1), idx)
+		require.Equal(t, fmt.Sprintf("v-%03d", i), string(payload))
+		require.NoError(t, r.Ack(idx))
+	}
+}
+
+func TestEncryption_Roundtrip(t *testing.T) {
+	dir := t.TempDir()
+	key := make([]byte, 32)
+	for i := range key {
+		key[i] = byte(i)
+	}
+	enc := &EncryptionConfig{Key: key}
+
+	w, err := OpenWriter(WriterOptions{Dir: dir, Encryption: enc})
+	require.NoError(t, err)
+	for i := 0; i < 25; i++ {
+		_, err := w.Append([]byte(fmt.Sprintf("secret-payload-%02d", i)))
+		require.NoError(t, err)
+	}
+	require.NoError(t, w.Close())
+
+	// 1) Reader WITH the right key reads plaintext.
+	r, err := OpenReader(ReaderOptions{Dir: dir, Name: "ok", StartFrom: StartEarliest, Encryption: enc})
+	require.NoError(t, err)
+	defer r.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	for i := 0; i < 25; i++ {
+		payload, idx, err := r.Next(ctx)
+		require.NoError(t, err)
+		require.Equal(t, fmt.Sprintf("secret-payload-%02d", i), string(payload))
+		require.NoError(t, r.Ack(idx))
+		_ = idx
+	}
+
+	// 2) Reader with WRONG key gets ErrEncryption on first record.
+	wrong := make([]byte, 32)
+	wrong[0] = 1 // different
+	r2, err := OpenReader(ReaderOptions{
+		Dir:        dir,
+		Name:       "bad-key",
+		StartFrom:  StartEarliest,
+		Encryption: &EncryptionConfig{Key: wrong},
+	})
+	require.NoError(t, err)
+	defer r2.Close()
+	_, _, err = r2.Next(ctx)
+	require.ErrorIs(t, err, ErrEncryption)
+
+	// 3) Reader with NO key sees ciphertext bytes (frame integrity OK,
+	//    payload is whatever the AEAD wrote — definitely not the plaintext).
+	r3, err := OpenReader(ReaderOptions{Dir: dir, Name: "no-key", StartFrom: StartEarliest})
+	require.NoError(t, err)
+	defer r3.Close()
+	payload, _, err := r3.Next(ctx)
+	require.NoError(t, err)
+	require.NotEqual(t, "secret-payload-00", string(payload),
+		"reader without key must not see plaintext")
+}
+
+func TestEncryption_BadKeyLength(t *testing.T) {
+	dir := t.TempDir()
+	_, err := OpenWriter(WriterOptions{Dir: dir, Encryption: &EncryptionConfig{Key: []byte{1, 2, 3}}})
+	require.ErrorIs(t, err, ErrEncryption)
+}
+
+func TestReader_UseMmap(t *testing.T) {
+	dir := t.TempDir()
+	w, err := OpenWriter(WriterOptions{Dir: dir, MaxSegmentSize: 256})
+	require.NoError(t, err)
+	for i := 0; i < 100; i++ {
+		_, err := w.Append([]byte(fmt.Sprintf("v-%05d", i)))
+		require.NoError(t, err)
+	}
+	w.awaitRotations()
+	require.NoError(t, w.Close())
+
+	// Reader with UseMmap=true; verify all 100 records readable.
+	r, err := OpenReader(ReaderOptions{
+		Dir:       dir,
+		Name:      "mmap-rdr",
+		StartFrom: StartEarliest,
+		UseMmap:   true,
+	})
+	require.NoError(t, err)
+	defer r.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	for i := 0; i < 100; i++ {
+		payload, idx, err := r.Next(ctx)
+		require.NoError(t, err)
+		require.Equal(t, uint64(i+1), idx)
+		require.Equal(t, fmt.Sprintf("v-%05d", i), string(payload))
+		require.NoError(t, r.Ack(idx))
+	}
+}
+
 func TestPreallocateSegments(t *testing.T) {
 	dir := t.TempDir()
 	const segSize = 1 << 20 // 1 MiB
