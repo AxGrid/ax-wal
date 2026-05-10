@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/logo.svg" width="220" alt="ax-wal" />
+</p>
+
 # ax-wal
 
 A single-writer / many-reader, file-system-backed Write-Ahead Log for Go.

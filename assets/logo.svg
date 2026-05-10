@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="ax-wal logo">
+  <title>ax-wal</title>
+  <defs>
+    <linearGradient id="frame" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#1B2333"/>
+      <stop offset="100%" stop-color="#0B1018"/>
+    </linearGradient>
+    <linearGradient id="bar" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#FF9447"/>
+      <stop offset="100%" stop-color="#FF6A13"/>
+    </linearGradient>
+  </defs>
+
+  <!-- frame -->
+  <rect width="512" height="512" rx="96" fill="url(#frame)"/>
+  <rect x="6" y="6" width="500" height="500" rx="90"
+        fill="none" stroke="#FFFFFF" stroke-opacity="0.06" stroke-width="2"/>
+
+  <!-- 4 record bars: oldest → newest, top → bottom; last one is in-progress -->
+  <g transform="translate(96, 124)">
+    <rect x="0" y="0"   width="296" height="36" rx="8" fill="url(#bar)"/>
+    <rect x="0" y="60"  width="280" height="36" rx="8" fill="url(#bar)"/>
+    <rect x="0" y="120" width="240" height="36" rx="8" fill="url(#bar)"/>
+    <rect x="0" y="180" width="184" height="36" rx="8" fill="url(#bar)"/>
+  </g>
+
+  <!-- append head: vertical white bar showing "next write" position
+       sits right after the in-progress record (the shortest one) -->
+  <rect x="282" y="298" width="8" height="42" rx="4" fill="#F5F7FA"/>
+
+  <!-- wordmark -->
+  <text x="256" y="426"
+        text-anchor="middle"
+        font-family="ui-monospace, 'JetBrains Mono', 'SF Mono', Menlo, Consolas, monospace"
+        font-size="50" font-weight="700"
+        fill="#E6EDF3"
+        letter-spacing="3">ax-wal</text>
+</svg>
