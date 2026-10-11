@@ -145,10 +145,35 @@ type ReaderOptions struct {
     AckBatchInterval  time.Duration  // 0 = strict per-Ack fsync
     PollInterval      time.Duration  // fsnotify fallback
     UseMmap           bool           // mmap closed uncompressed segments
+    SkipCorruptSegments bool         // move past a damaged closed segment instead of failing
     Encryption        *EncryptionConfig
     Logger            *slog.Logger
 }
 ```
+
+Full reader guide — every option, start positions, acks, errors, remote
+and archive readers, CLI flags (in Russian): [docs/READER.md](docs/READER.md).
+
+#### What a reader does when the log changes under it
+
+A reader never hands out a record under the wrong index and never stalls
+silently. `Next` either delivers the next record, waits because the log
+really ends there, skips a hole that really exists (and reports it), or
+returns an error.
+
+| Situation | Behavior |
+|---|---|
+| End of the log; writer idle, closed, or not started yet | `Next` blocks until a record arrives or `ctx` ends. |
+| Segment rotated / compressed / archived while being read | Transparent. A file that vanishes between listing and opening is looked up again, not reported as an error. |
+| Segment deleted behind the reader's cursor (retention after archive) | Nothing to notice — retention never deletes what a live reader hasn't acknowledged. |
+| Records the reader still needs are gone: `TruncatePrefix`, `MaxRetainAge`, a segment removed by hand, the log starts later than the reader's position | After the hole has persisted for 1 s the reader jumps to the first index that exists, logs a warning with the missing range, and counts it in `Stats().SkippedRecords`. |
+| Reader was away and comes back | Resumes after its last `Ack`; if that position no longer exists, fast-forwards at `OpenReader`. |
+| Writer crashed mid-record (torn tail in the open segment) | Waits. The restarted writer cuts the tail off and the reader continues with the next real record. |
+| Writer lost its tail and is now *behind* the reader's position | Waits for the log to reach that index again (one warning is logged). |
+| Closed segment damaged: CRC mismatch, file shorter than its name says, undecodable zstd | Default: `Next` returns the error (`ErrCorruptRecord` / `ErrTruncatedRecord`) and keeps returning it. With `SkipCorruptSegments`: logs an error, gives up the rest of that segment (`SkippedRecords`), continues with the next. |
+| Open segment damaged while the writer keeps appending past it | `Next` returns `ErrCorruptRecord` (sticky). Once the segment rotates, the closed-segment rule applies. |
+
+Alert on `SkippedRecords > 0` if a reader must not lose records.
 
 ### SyncMode — the durability dial
 

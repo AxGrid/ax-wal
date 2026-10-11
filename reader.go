@@ -84,6 +84,19 @@ type ReaderOptions struct {
 	// Logger receives reader-side log events. Defaults to slog.Default().
 	Logger *slog.Logger
 
+	// SkipCorruptSegments decides what happens when a CLOSED segment turns
+	// out to be damaged: a record fails its CRC, the file ends before the
+	// last index its name promises, or it can't be decompressed.
+	//
+	// false (default): Next returns the error (wrapping ErrCorruptRecord or
+	// ErrTruncatedRecord) and keeps returning it — the reader does not move
+	// past records it could not deliver.
+	//
+	// true: the rest of that segment is given up; the reader logs an error,
+	// counts the lost records in ReaderStats.SkippedRecords and continues
+	// with the next segment.
+	SkipCorruptSegments bool
+
 	// forceStart (with StartFrom == StartAt) discards an existing cursor
 	// position and starts at StartAtIndex. Used by the server for replicas.
 	forceStart bool
@@ -99,6 +112,10 @@ type ReaderStats struct {
 	ErrCorruptSegs uint64 // closed segments that returned ErrCorruptRecord
 	SegmentSwitches uint64
 	WaitWakeups    uint64
+	// SkippedRecords counts records the reader had to jump over because they
+	// no longer exist: their segment was deleted (retention, TruncatePrefix,
+	// by hand) or, with SkipCorruptSegments, was damaged.
+	SkippedRecords uint64
 }
 
 // Reader is a tail-and-follow consumer of a WAL.
@@ -137,6 +154,19 @@ type Reader struct {
 		off   int64
 	}
 
+	// gapSince / gapTarget: when the reader first noticed that the record it
+	// needs isn't in any segment while later ones exist.
+	gapSince  time.Time
+	gapTarget uint64
+	// warnedBehind: the "writer is behind this reader" warning was logged.
+	warnedBehind bool
+	// bad*: where a CRC-invalid frame was seen at the tail of the open
+	// segment, and how big the file was then.
+	badSeen  bool
+	badFirst uint64
+	badOff   int64
+	badSize  int64
+
 	file    *os.File
 	br      *bufio.Reader
 	zstd    *zstd.Decoder
@@ -149,6 +179,7 @@ type readerCounters struct {
 	errCorruptSegs  atomic.Uint64
 	segmentSwitches atomic.Uint64
 	waitWakeups     atomic.Uint64
+	skippedRecords  atomic.Uint64
 }
 
 // OpenReader registers a reader with the given name. Returns an error if a
@@ -320,6 +351,7 @@ func (r *Reader) Stats() ReaderStats {
 		ErrCorruptSegs:  r.cnt.errCorruptSegs.Load(),
 		SegmentSwitches: r.cnt.segmentSwitches.Load(),
 		WaitWakeups:     r.cnt.waitWakeups.Load(),
+		SkippedRecords:  r.cnt.skippedRecords.Load(),
 	}
 }
 
@@ -338,7 +370,12 @@ func (r *Reader) Next(ctx context.Context) ([]byte, uint64, error) {
 				return nil, 0, err
 			}
 			if r.file == nil {
-				// No segment yet — wait and retry.
+				// Nothing holds nextIdx. Either we are at the end of the log
+				// (wait for the writer) or the records are gone for good
+				// (jump to the next ones that exist).
+				if r.skipGap() {
+					continue
+				}
 				if err := r.waitForChange(ctx); err != nil {
 					return nil, 0, err
 				}
@@ -361,10 +398,10 @@ func (r *Reader) Next(ctx context.Context) ([]byte, uint64, error) {
 			}
 			return payload, idx, nil
 
-		case errors.Is(err, io.EOF):
-			// Possibly: writer just appended (open segment), writer rotated
-			// (closed under us), or genuine end of stream. Try advancing first;
-			// if no successor segment exists, wait.
+		case errors.Is(err, io.EOF) && r.segIsOpen:
+			// Possibly: writer just appended, writer rotated (the file was
+			// renamed under us), or genuine end of stream. Try advancing
+			// first; if no successor segment exists, wait.
 			advanced, aerr := r.tryAdvanceSegment()
 			if aerr != nil {
 				return nil, 0, aerr
@@ -377,31 +414,145 @@ func (r *Reader) Next(ctx context.Context) ([]byte, uint64, error) {
 			}
 			continue
 
-		case errors.Is(err, ErrTruncatedRecord):
-			// Two possible causes on what was the open segment:
-			//   (a) writer is mid-Append: bytes flushed into page cache but the
-			//       record isn't complete yet. Wait, then re-read from the same
-			//       file at the same logical position.
-			//   (b) writer rotated: the file was renamed wal-F- -> wal-F-L while
-			//       we were mid-frame. The renamed file is still readable via
-			//       our FD, but we want to refresh from disk to pick up the
-			//       new closed form.
-			// Both are handled the same way: drop our state and let
-			// openSegmentForIndex pick the right segment for r.nextIdx on the
-			// next loop turn.
-			if r.segIsOpen {
-				r.dropForRetry()
-				if err := r.waitForChange(ctx); err != nil {
-					return nil, 0, err
+		case errors.Is(err, io.EOF):
+			// End of a closed segment.
+			if r.nextIdx.Load() <= r.segLast {
+				// It holds fewer records than its name promises.
+				if serr := r.badSegment(fmt.Errorf("%w: file ends at index %d, expected %d",
+					ErrTruncatedRecord, r.nextIdx.Load()-1, r.segLast)); serr != nil {
+					return nil, 0, serr
 				}
 				continue
 			}
-			return nil, 0, fmt.Errorf("closed segment %s truncated mid-record: %w", r.segPath, err)
+			// Done with it; the next loop turn finds the successor, waits
+			// for one, or detects that it is missing.
+			r.closeCurrentFile()
+			continue
+
+		case r.segIsOpen && errors.Is(err, ErrCorruptRecord) && r.openSegmentDamaged():
+			// A complete but invalid frame, and the writer has appended past
+			// it since we first saw it: not a torn tail, the segment itself
+			// is damaged. Waiting won't help.
+			name, at := filepath.Base(r.segPath), r.nextIdx.Load()
+			r.cnt.errCorruptSegs.Add(1)
+			r.dropForRetry()
+			return nil, 0, fmt.Errorf("axwal: open segment %s is damaged at index %d (the writer kept appending past it): %w",
+				name, at, err)
+
+		case r.segIsOpen && (errors.Is(err, ErrTruncatedRecord) || errors.Is(err, ErrCorruptRecord)):
+			// The tail of the open segment isn't a complete record:
+			//   (a) the writer is mid-Append — the rest arrives in a moment;
+			//   (b) the writer rotated while we were mid-frame;
+			//   (c) the writer crashed mid-write — its recovery will cut the
+			//       torn tail off on restart.
+			// In every case: remember where this record starts, let go of
+			// the file, and look again after the next change.
+			r.dropForRetry()
+			if err := r.waitForChange(ctx); err != nil {
+				return nil, 0, err
+			}
+			continue
 
 		default:
-			return nil, 0, err
+			if r.segIsOpen {
+				return nil, 0, err
+			}
+			// A closed segment is immutable: this will not get better.
+			if serr := r.badSegment(err); serr != nil {
+				return nil, 0, serr
+			}
+			continue
 		}
 	}
+}
+
+// openSegmentDamaged is called when the frame at the reader's position in
+// the open segment fails its CRC. The first time it just notes the position
+// (a writer that crashed mid-write leaves exactly this, and its recovery
+// removes it). It reports true once the file has grown beyond that point
+// while the frame is still invalid.
+func (r *Reader) openSegmentDamaged() bool {
+	var size int64
+	if fi, err := r.file.Stat(); err == nil {
+		size = fi.Size()
+	}
+	if r.badSeen && r.badFirst == r.segFirst && r.badOff == r.segOff {
+		return size > r.badSize
+	}
+	r.badSeen, r.badFirst, r.badOff, r.badSize = true, r.segFirst, r.segOff, size
+	return false
+}
+
+// gapGrace is how long a hole in the log must persist before the reader
+// jumps over it. A directory listing taken while the writer renames a
+// segment can momentarily miss that segment; waiting rules that out before
+// records are declared gone.
+var gapGrace = time.Second
+
+// skipGap is called when no segment holds nextIdx. If later records exist it
+// is a hole — the segment was deleted by retention, TruncatePrefix or by
+// hand — and once that has been true for gapGrace the reader moves to the
+// first index that is still there. Returns true if it moved.
+func (r *Reader) skipGap() bool {
+	target := r.nextIdx.Load()
+	segs, err := r.listSegments()
+	if err != nil {
+		return false
+	}
+	var next uint64
+	for _, s := range segs {
+		if s.FirstIndex <= target {
+			if !s.Closed || target <= s.LastIndex {
+				// Something does (or will) hold target: not a hole.
+				r.gapSince = time.Time{}
+				return false
+			}
+			continue
+		}
+		if next == 0 || s.FirstIndex < next {
+			next = s.FirstIndex
+		}
+	}
+	if next == 0 {
+		r.gapSince = time.Time{} // end of the log
+		return false
+	}
+	if r.gapSince.IsZero() || r.gapTarget != target {
+		r.gapSince, r.gapTarget = time.Now(), target
+		return false
+	}
+	if time.Since(r.gapSince) < gapGrace {
+		return false
+	}
+	r.gapSince = time.Time{}
+	r.cnt.skippedRecords.Add(next - target)
+	r.log.Warn("records are gone from the WAL; skipping ahead (data loss for this reader)",
+		"missing_from", target, "missing_to", next-1, "resuming_at", next)
+	r.nextIdx.Store(next)
+	return true
+}
+
+// badSegment handles a damaged closed segment according to
+// SkipCorruptSegments. It returns the error to surface, or nil if the reader
+// moved on to the next segment.
+func (r *Reader) badSegment(cause error) error {
+	r.cnt.errCorruptSegs.Add(1)
+	name, last, at := filepath.Base(r.segPath), r.segLast, r.nextIdx.Load()
+	// Either way let go of the file: the read position inside it can't be
+	// trusted any more. Without skipping, the next call reopens the segment
+	// and reports the same error again instead of handing out records under
+	// wrong indices.
+	r.closeCurrentFile()
+	if !r.opts.SkipCorruptSegments {
+		return fmt.Errorf("axwal: closed segment %s is damaged at index %d: %w", name, at, cause)
+	}
+	if last >= at {
+		r.cnt.skippedRecords.Add(last - at + 1)
+	}
+	r.log.Error("closed segment is damaged; skipping the rest of it (data loss for this reader)",
+		"name", name, "lost_from", at, "lost_to", last, "err", cause)
+	r.nextIdx.Store(last + 1)
+	return nil
 }
 
 // NextBatch reads up to `max` records from the current position and returns
@@ -432,17 +583,19 @@ func (r *Reader) NextBatch(ctx context.Context, max int) (payloads [][]byte, ind
 	for len(payloads) < max && r.file != nil {
 		payload, perr := readRecord(r.readerSource())
 		if perr != nil {
-			// Stop gracefully on EOF / truncation; surface real errors only if
-			// we have nothing yet (we don't — we have at least one record).
-			if errors.Is(perr, io.EOF) || errors.Is(perr, ErrTruncatedRecord) {
-				if errors.Is(perr, ErrTruncatedRecord) && r.segIsOpen {
-					// Mirror Next() behavior: drop the file so the next call
-					// re-opens at the proper segment.
+			// Never fail here: we already hold at least one record. Leave the
+			// reader in a state from which the next (blocking) call sorts it
+			// out — a clean EOF needs nothing; after anything else the read
+			// position is no longer on a record boundary, so let go of the
+			// file and have Next reopen it and apply its error handling.
+			if !errors.Is(perr, io.EOF) {
+				if r.segIsOpen {
 					r.dropForRetry()
+				} else {
+					r.closeCurrentFile()
 				}
-				break
 			}
-			return payloads, indices, perr
+			break
 		}
 		nextIdx := r.nextIdx.Load()
 		r.nextIdx.Store(nextIdx + 1)
@@ -534,24 +687,42 @@ func (r *Reader) closeCurrentFile() {
 // openSegmentForIndex opens whichever segment contains r.nextIdx. If none is
 // available yet, leaves r.file == nil and returns nil error (caller will wait).
 func (r *Reader) openSegmentForIndex(ctx context.Context) error {
-	target := r.nextIdx.Load()
-	candidates, err := r.listSegments()
-	if err != nil {
-		return err
-	}
-	// Prefer a closed segment that exactly contains the target index.
-	for _, s := range candidates {
-		if s.Closed && s.FirstIndex <= target && target <= s.LastIndex {
-			return r.openSegment(s)
+	// A segment can vanish between listing and opening (compression swaps
+	// wal-F-L for wal-F-L.zst, retention deletes); look again right away
+	// a couple of times before falling back to waiting.
+	for attempt := 0; attempt < 3; attempt++ {
+		target := r.nextIdx.Load()
+		candidates, err := r.listSegments()
+		if err != nil {
+			return err
+		}
+		var pick *segName
+		// Prefer a closed segment that exactly contains the target index.
+		for i, s := range candidates {
+			if s.Closed && s.FirstIndex <= target && target <= s.LastIndex {
+				pick = &candidates[i]
+				break
+			}
+		}
+		// Otherwise: the open segment if its FirstIndex <= target.
+		if pick == nil {
+			for i, s := range candidates {
+				if !s.Closed && s.FirstIndex <= target {
+					pick = &candidates[i]
+					break
+				}
+			}
+		}
+		if pick == nil {
+			return nil // no suitable segment yet
+		}
+		if err := r.openSegment(*pick); err != nil {
+			return err
+		}
+		if r.file != nil || !pick.Closed {
+			return nil
 		}
 	}
-	// Otherwise: the open segment if its FirstIndex <= target.
-	for _, s := range candidates {
-		if !s.Closed && s.FirstIndex <= target {
-			return r.openSegment(s)
-		}
-	}
-	// No suitable segment yet.
 	return nil
 }
 
@@ -560,9 +731,16 @@ func (r *Reader) openSegment(s segName) error {
 	r.closeCurrentFile()
 	path := filepath.Join(r.dir, s.Name)
 	f, err := os.Open(path)
+	if errors.Is(err, os.ErrNotExist) {
+		// Listed a moment ago, gone now: compressed (wal-F-L -> .zst),
+		// rotated or deleted in between. Not an error — the caller looks at
+		// the directory again.
+		return nil
+	}
 	if err != nil {
 		return err
 	}
+	r.cnt.segmentSwitches.Add(1)
 
 	// Same segment we were just reading (possibly renamed to its closed form
 	// by a rotation — the bytes are identical): continue at the saved offset
@@ -616,10 +794,29 @@ func (r *Reader) openSegment(s segName) error {
 	skip := target - r.segFirst
 	for i := uint64(0); i < skip; i++ {
 		p, err := readRecord(r.br)
-		if err != nil {
-			return fmt.Errorf("skipping to index %d in %s: %w", target, s.Name, err)
+		if err == nil {
+			r.segOff += int64(headerSize + len(p))
+			continue
 		}
-		r.segOff += int64(headerSize + len(p))
+		if !s.Closed {
+			// The open segment doesn't reach our position (yet). Normally
+			// impossible — we only ever ask for an index we were given or
+			// the one after it — so the writer must have lost its tail in a
+			// crash (SyncNone / SyncBarrier) and is rewriting those indices.
+			// Wait for it to get here rather than fail.
+			if !r.warnedBehind {
+				r.warnedBehind = true
+				r.log.Warn("the WAL ends before this reader's position; waiting for the writer to reach it "+
+					"(records were lost on the writer side?)",
+					"reader_index", target, "segment", s.Name, "segment_has", r.segFirst+i-1)
+			}
+			r.closeCurrentFile()
+			return nil
+		}
+		if errors.Is(err, io.EOF) {
+			err = fmt.Errorf("%w: file ends at index %d, expected %d", ErrTruncatedRecord, r.segFirst+i-1, s.LastIndex)
+		}
+		return r.badSegment(err)
 	}
 	return nil
 }
@@ -668,6 +865,7 @@ func (r *Reader) tryAdvanceSegment() (bool, error) {
 // waitForChange blocks until either a relevant filesystem event arrives, the
 // poll interval ticks, or ctx is canceled.
 func (r *Reader) waitForChange(ctx context.Context) error {
+	r.cnt.waitWakeups.Add(1)
 	t := time.NewTimer(r.opts.PollInterval)
 	defer t.Stop()
 	select {

@@ -1,5 +1,48 @@
 # Changelog
 
+## v0.3.4 — 2026-10-12
+
+Reader configuration guide (Russian): [docs/READER.md](docs/READER.md).
+
+Reader robustness. A new scenario suite (`reader_scenarios_test.go`) walks a
+reader through deleted, truncated, archived, compressed and damaged segments;
+the previous reader stalled or mislabeled records in 9 of its 14 scenarios.
+
+### Fixed
+
+- **Stall on a hole.** When the records a running reader needed next were
+  gone (`TruncatePrefix`, `MaxRetainAge`, a segment removed by hand, a log
+  that starts later than the reader's position), `Next` waited forever.
+  It now jumps to the first index that exists once the hole has persisted
+  for 1 s, logs the missing range and counts it in
+  `ReaderStats.SkippedRecords`.
+- **Spurious "no such file" errors.** A segment compressed, rotated or
+  deleted between directory listing and open made `Next` fail; the reader
+  now looks again.
+- **Mislabeled records after a CRC error.** After `ErrCorruptRecord` in a
+  closed segment the next call returned the following record under the
+  failed record's index. A truncated closed segment produced one error and
+  then a silent stall. Both are now a sticky error, or — with the new
+  `ReaderOptions.SkipCorruptSegments` — a logged, counted skip to the next
+  segment. A closed segment holding fewer records than its name says is
+  detected the same way (it used to stall).
+- **Torn tail after a writer crash.** A complete frame with a bad CRC at the
+  tail of the open segment made the reader fail and lose its place; it now
+  waits for the writer's recovery, like it already did for a partial frame.
+  If the writer keeps appending past the bad frame, the reader reports
+  `ErrCorruptRecord`.
+- **Writer behind the reader** (tail lost in a crash without fsync): `Next`
+  failed with "skipping to index …: EOF" on every call; it now waits for
+  the log to reach the reader's position.
+- `NextBatch` no longer leaves the reader mid-frame after an error in its
+  non-blocking part.
+- `ReaderStats.SegmentSwitches`, `WaitWakeups` and `ErrCorruptSegs` were
+  never incremented.
+
+### Added
+
+- `ReaderOptions.SkipCorruptSegments`, `ReaderStats.SkippedRecords`.
+
 ## v0.3.3 — 2026-10-11
 
 ### Fixed
