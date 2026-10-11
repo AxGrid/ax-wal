@@ -1,6 +1,7 @@
 package axwal
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os"
@@ -1098,7 +1099,7 @@ func TestAppendContext_CanceledMidWait(t *testing.T) {
 	dir := t.TempDir()
 	release := make(chan struct{})
 	w, err := OpenWriter(WriterOptions{
-		Dir: dir,
+		Dir:         dir,
 		GroupCommit: GroupCommitConfig{Enabled: true},
 		// Hold the fsync so we control when the commit happens.
 		beforeSync: func() { <-release },
@@ -1183,4 +1184,46 @@ func listFilenames(t *testing.T, dir, pattern string) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// A reader sitting on the writer's tail regularly catches a record that is
+// only partly written (records larger than the writer's buffer go to the file
+// in several writes). It must resume exactly there — across rotations too.
+func TestTailAndFollow_LargeRecords(t *testing.T) {
+	dir := t.TempDir()
+	w, err := OpenWriter(WriterOptions{
+		Dir: dir, SyncMode: SyncNone, MaxSegmentSize: 3 << 20,
+		GroupCommit: GroupCommitConfig{Enabled: true},
+	})
+	require.NoError(t, err)
+	defer w.Close()
+
+	const n = 400
+	mk := func(i int) []byte {
+		p := make([]byte, 150_000+i*97)
+		for j := range p {
+			p[j] = byte(i + j)
+		}
+		return p
+	}
+	go func() {
+		for i := 1; i <= n; i++ {
+			if _, err := w.Append(mk(i)); err != nil {
+				return
+			}
+		}
+	}()
+
+	r, err := OpenReader(ReaderOptions{Dir: dir, Name: "tail", PollInterval: 5 * time.Millisecond})
+	require.NoError(t, err)
+	defer r.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	for i := 1; i <= n; i++ {
+		p, idx, err := r.Next(ctx)
+		require.NoError(t, err)
+		require.Equal(t, uint64(i), idx)
+		require.True(t, bytes.Equal(mk(i), p), "payload %d differs", i)
+	}
+	require.Greater(t, r.Stats().SegmentSwitches+uint64(len(closedSegments(t, dir))), uint64(5))
 }

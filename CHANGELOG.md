@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.3.3 — 2026-10-11
+
+### Fixed
+
+- `Reader` on the writer's tail: after reading a record that was only partly
+  written yet, it reopened the segment and walked every record from the
+  start to get back to its position — on each such hit. Records larger than
+  a few KB make that the common case (they reach the file in several
+  writes), and a reader that keeps up with the writer, like the server side
+  of a synchronous replica, paid it constantly. It now resumes at the saved
+  byte offset, also across a rotation. Synchronous replication, `SyncFull` +
+  `GroupCommit`, 64 writers: 2 KB records 6 578 → 35 735 rec/s, 8 KB
+  2 870 → 24 990, 32 KB 1 921 → 9 806.
+
 ## v0.3.2 — 2026-10-11
 
 ### Changed

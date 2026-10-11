@@ -125,6 +125,18 @@ type Reader struct {
 	segIsOpen bool
 	segCompressed bool
 
+	// segOff is the byte offset in the current segment just past the last
+	// record read; resume remembers it across a drop-and-reopen so a reader
+	// sitting on the writer's tail doesn't rescan the segment from its start
+	// every time it catches a record mid-write.
+	segOff int64
+	resume struct {
+		ok    bool
+		first uint64 // FirstIndex of the segment
+		idx   uint64 // record index that sits at off
+		off   int64
+	}
+
 	file    *os.File
 	br      *bufio.Reader
 	zstd    *zstd.Decoder
@@ -339,6 +351,7 @@ func (r *Reader) Next(ctx context.Context) ([]byte, uint64, error) {
 		case err == nil:
 			idx := r.nextIdx.Load()
 			r.nextIdx.Store(idx + 1)
+			r.segOff += int64(headerSize + len(payload))
 			if r.cipher != nil {
 				pt, derr := r.cipher.open(payload)
 				if derr != nil {
@@ -377,7 +390,7 @@ func (r *Reader) Next(ctx context.Context) ([]byte, uint64, error) {
 			// openSegmentForIndex pick the right segment for r.nextIdx on the
 			// next loop turn.
 			if r.segIsOpen {
-				r.closeCurrentFile()
+				r.dropForRetry()
 				if err := r.waitForChange(ctx); err != nil {
 					return nil, 0, err
 				}
@@ -425,7 +438,7 @@ func (r *Reader) NextBatch(ctx context.Context, max int) (payloads [][]byte, ind
 				if errors.Is(perr, ErrTruncatedRecord) && r.segIsOpen {
 					// Mirror Next() behavior: drop the file so the next call
 					// re-opens at the proper segment.
-					r.closeCurrentFile()
+					r.dropForRetry()
 				}
 				break
 			}
@@ -433,6 +446,7 @@ func (r *Reader) NextBatch(ctx context.Context, max int) (payloads [][]byte, ind
 		}
 		nextIdx := r.nextIdx.Load()
 		r.nextIdx.Store(nextIdx + 1)
+		r.segOff += int64(headerSize + len(payload))
 		r.cnt.nextCalls.Add(1)
 		if r.cipher != nil {
 			pt, derr := r.cipher.open(payload)
@@ -483,6 +497,17 @@ func (r *Reader) readerSource() io.Reader {
 	return r.br
 }
 
+// dropForRetry closes the current (open) segment after a partial frame was
+// read at its tail, remembering where the next record starts.
+func (r *Reader) dropForRetry() {
+	first, off, idx := r.segFirst, r.segOff, r.nextIdx.Load()
+	uncompressed := !r.segCompressed
+	r.closeCurrentFile()
+	if uncompressed {
+		r.resume.ok, r.resume.first, r.resume.idx, r.resume.off = true, first, idx, off
+	}
+}
+
 func (r *Reader) closeCurrentFile() {
 	if r.zstd != nil {
 		r.zstd.Close()
@@ -497,6 +522,8 @@ func (r *Reader) closeCurrentFile() {
 		r.file = nil
 	}
 	r.br = nil
+	r.resume.ok = false
+	r.segOff = 0
 	r.segPath = ""
 	r.segFirst = 0
 	r.segLast = 0
@@ -529,11 +556,23 @@ func (r *Reader) openSegmentForIndex(ctx context.Context) error {
 }
 
 func (r *Reader) openSegment(s segName) error {
+	resume := r.resume
 	r.closeCurrentFile()
 	path := filepath.Join(r.dir, s.Name)
 	f, err := os.Open(path)
 	if err != nil {
 		return err
+	}
+
+	// Same segment we were just reading (possibly renamed to its closed form
+	// by a rotation — the bytes are identical): continue at the saved offset
+	// instead of walking every record from the start.
+	target := r.nextIdx.Load()
+	resumed := false
+	if resume.ok && resume.first == s.FirstIndex && resume.idx == target && s.Compression == "" {
+		if _, err := f.Seek(resume.off, io.SeekStart); err == nil {
+			resumed = true
+		}
 	}
 
 	var src io.Reader = f
@@ -547,7 +586,7 @@ func (r *Reader) openSegment(s segName) error {
 		}
 		r.zstd = dec
 		src = dec
-	} else if r.opts.UseMmap && s.Closed {
+	} else if r.opts.UseMmap && s.Closed && !resumed {
 		// mmap the closed uncompressed segment for parse-from-page-cache speed.
 		fi, statErr := f.Stat()
 		if statErr == nil && fi.Size() > 0 {
@@ -568,13 +607,19 @@ func (r *Reader) openSegment(s segName) error {
 	r.segLast = s.LastIndex
 	r.segIsOpen = !s.Closed
 
+	if resumed {
+		r.segOff = resume.off
+		return nil
+	}
+
 	// Skip records until we land on r.nextIdx.
-	target := r.nextIdx.Load()
 	skip := target - r.segFirst
 	for i := uint64(0); i < skip; i++ {
-		if _, err := readRecord(r.br); err != nil {
+		p, err := readRecord(r.br)
+		if err != nil {
 			return fmt.Errorf("skipping to index %d in %s: %w", target, s.Name, err)
 		}
+		r.segOff += int64(headerSize + len(p))
 	}
 	return nil
 }
