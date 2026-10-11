@@ -182,6 +182,10 @@ type WriterOptions struct {
 	// nowFn overrides the clock in tests.
 	nowFn func() time.Time
 
+	// beforeSync, if set, runs before every fsync (tests use it to hold a
+	// commit back).
+	beforeSync func()
+
 	// replica is set by RunReplica: the only writer allowed into a directory
 	// that carries the replica marker.
 	replica bool
@@ -253,12 +257,14 @@ func (m SyncMode) String() string {
 type GroupCommitConfig struct {
 	Enabled bool
 
-	// MaxLatency caps how long an Append waits for its batch to flush.
-	// Defaults to 1ms.
+	// MaxLatency is the period of the fallback timer that re-checks for
+	// pending records. Commits are normally triggered by the appends
+	// themselves and start as soon as the previous fsync has finished, so
+	// this is not a delay added to every append. Defaults to 1ms.
 	MaxLatency time.Duration
 
-	// MaxBatchBytes triggers an early flush when this many unflushed bytes
-	// have accumulated. Defaults to 1 MiB.
+	// MaxBatchBytes is kept for compatibility and no longer used: the
+	// batch is whatever accumulated while the previous fsync was running.
 	MaxBatchBytes int
 }
 
@@ -825,11 +831,10 @@ func (w *Writer) appendBatchLocal(ctx context.Context, records [][]byte) ([]uint
 	w.cnt.appendBytes.Add(uint64(totalSize))
 
 	if w.opts.GroupCommit.Enabled {
-		// Kick the commit goroutine if our batch alone exceeds the bytes
-		// threshold; otherwise the timer will pick it up.
-		if w.pendingBytes >= w.opts.GroupCommit.MaxBatchBytes {
-			w.kickCommit()
-		}
+		// Wake the commit goroutine right away. If an fsync is already in
+		// flight our records ride on the next one, together with everything
+		// else that arrives until then.
+		w.kickCommit()
 
 		// ctx-aware wait: if the caller's ctx is cancellable, spawn a watcher
 		// that broadcasts on the cond so the Wait() unblocks.
@@ -928,6 +933,9 @@ func (w *Writer) flushAndSyncLocked() error {
 
 // syncFile applies the configured SyncMode and bumps fsync counters.
 func (w *Writer) syncFile(f *os.File) error {
+	if w.opts.beforeSync != nil {
+		w.opts.beforeSync()
+	}
 	if w.opts.SyncMode == SyncNone {
 		return nil
 	}

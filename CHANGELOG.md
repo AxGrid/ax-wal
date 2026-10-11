@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.3.2 — 2026-10-11
+
+### Changed
+
+- **Group commit no longer waits for a timer.** The commit goroutine starts
+  an fsync as soon as records are pending and runs it without holding the
+  writer lock, so appends keep buffering meanwhile and ride on the next
+  fsync. Batches size themselves to the disk. Before, every commit waited
+  up to `MaxLatency` (1 ms) first, which on a fast disk (fsync ≈ 0.1 ms)
+  made `GroupCommit` slower than plain appends. Measured on a server with a
+  RAID controller cache, `SyncFull`, 512-byte records: 1 writer 722 → 7 909
+  rec/s, 8 writers 5 087 → 27 102, 64 writers 45 085 → 96 670.
+  `GroupCommitConfig.MaxLatency` is now only the period of a fallback timer;
+  `MaxBatchBytes` is unused.
+- `Reader`: when caught up with the writer, a wakeup no longer lists the
+  directory (one `stat` instead).
+
 ## v0.3.1 — 2026-10-11
 
 ### Fixed

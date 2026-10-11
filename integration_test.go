@@ -1096,16 +1096,16 @@ func TestReader_Lag(t *testing.T) {
 
 func TestAppendContext_CanceledMidWait(t *testing.T) {
 	dir := t.TempDir()
+	release := make(chan struct{})
 	w, err := OpenWriter(WriterOptions{
 		Dir: dir,
-		GroupCommit: GroupCommitConfig{
-			Enabled: true,
-			// Long latency so we control when the commit happens.
-			MaxLatency: time.Hour,
-		},
+		GroupCommit: GroupCommitConfig{Enabled: true},
+		// Hold the fsync so we control when the commit happens.
+		beforeSync: func() { <-release },
 	})
 	require.NoError(t, err)
 	defer w.Close()
+	defer close(release)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)

@@ -4,10 +4,15 @@ import (
 	"time"
 )
 
-// commitLoop drives group-commit. It waits up to MaxLatency for a kick (or a
-// timer tick) and then performs a single Flush+Sync covering all data that
-// arrived during the window. All Append callers waiting on commitIndex are
-// then woken up.
+// commitLoop drives group-commit. Whenever records are pending it flushes the
+// buffer and fsyncs, then wakes every Append whose records that fsync covered.
+//
+// The fsync runs WITHOUT the writer lock, so appenders keep adding records to
+// the buffer while the disk is busy; they are picked up by the next cycle.
+// The batch size therefore adapts by itself: on a slow disk many appends pile
+// up per fsync, on a fast one the loop simply spins faster. There is no
+// artificial wait — an append is committed as soon as the disk allows. The
+// MaxLatency ticker only remains as a safety net for a missed kick.
 func (w *Writer) commitLoop() {
 	defer w.gcWG.Done()
 	t := time.NewTicker(w.opts.GroupCommit.MaxLatency)
@@ -25,21 +30,44 @@ func (w *Writer) commitLoop() {
 			w.mu.Unlock()
 			return
 		}
-		if w.pendingBytes == 0 {
+		if w.pendingBytes == 0 || w.file == nil {
 			w.mu.Unlock()
 			continue
 		}
-		want := w.lastIndex
-		if err := w.flushAndSyncLocked(); err != nil {
-			w.log.Error("group-commit fsync failed", "err", err)
-			// Don't advance commitIndex; waiters will keep waiting and the
-			// next tick will retry.
+		if err := w.buf.Flush(); err != nil {
+			w.log.Error("group-commit flush failed", "err", err)
 			w.mu.Unlock()
 			continue
 		}
-		w.commitIndex = want
-		w.gcCond.Broadcast()
+		// Everything up to `want` is now in the file; `syncing` bytes of the
+		// pending count are what this fsync will make durable.
+		want, syncing, file := w.lastIndex, w.pendingBytes, w.file
 		w.mu.Unlock()
+
+		err := w.syncFile(file)
+
+		w.mu.Lock()
+		switch {
+		case w.file != file:
+			// The segment was rotated (or the writer closed) meanwhile. That
+			// path does its own flush+sync and commit; our fsync may even
+			// have hit the closed file. Nothing left to do for this batch.
+		case err != nil:
+			w.log.Error("group-commit fsync failed", "err", err)
+			// Don't advance commitIndex; waiters keep waiting and the next
+			// tick retries.
+		default:
+			w.pendingBytes -= syncing
+			if want > w.commitIndex {
+				w.commitIndex = want
+			}
+			w.gcCond.Broadcast()
+		}
+		more := !w.closed && w.pendingBytes > 0
+		w.mu.Unlock()
+		if more {
+			w.kickCommit()
+		}
 	}
 }
 

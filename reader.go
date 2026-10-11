@@ -582,6 +582,15 @@ func (r *Reader) openSegment(s segName) error {
 // tryAdvanceSegment is called after an EOF on the current segment.
 // Returns true if it switched to a new segment; false if there is none yet.
 func (r *Reader) tryAdvanceSegment() (bool, error) {
+	// Fast path for the common case "caught up with the writer": rotation
+	// renames the open segment, so as long as it still exists under its open
+	// name there is nothing to advance to — no need to list the directory on
+	// every wakeup.
+	if r.segIsOpen {
+		if _, err := os.Stat(r.segPath); err == nil {
+			return false, nil
+		}
+	}
 	candidates, err := r.listSegments()
 	if err != nil {
 		return false, err
