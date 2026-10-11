@@ -194,6 +194,21 @@ func (cs *cursorState) Ack(index uint64) error {
 	return nil
 }
 
+// reset moves the cursor to index unconditionally (it may go backwards).
+// Only valid before the heartbeat goroutine is started.
+func (cs *cursorState) reset(index uint64) error {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	rec := cs.rec
+	rec.Index = index
+	if err := cs.persist(rec); err != nil {
+		return err
+	}
+	cs.rec = rec
+	cs.hbIndex.Store(index)
+	return nil
+}
+
 // CurrentIndex returns the most recently Ack'd index.
 func (cs *cursorState) CurrentIndex() uint64 {
 	cs.mu.Lock()

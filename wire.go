@@ -48,6 +48,12 @@ type helloPayload struct {
 	Name       string `json:"name"`
 	StartIndex uint64 `json:"start_index"`
 	BatchSize  int    `json:"batch_size"`
+
+	// Exact makes StartIndex authoritative: the server-side cursor is reset
+	// to StartIndex-1 instead of resuming from wherever it was. A replica
+	// sets it, because its own WAL — not the source's cursor — is the truth
+	// about what it has.
+	Exact bool `json:"exact,omitempty"`
 }
 
 type errPayload struct {

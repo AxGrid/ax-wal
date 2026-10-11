@@ -1,5 +1,47 @@
 # Changelog
 
+## v0.3.0 — 2026-10-11
+
+Replication: read-only replica over SSH with automatic reconnect, optional
+synchronous mode. Operator guide (Russian): [docs/REPLICATION.md](docs/REPLICATION.md).
+
+### Added
+
+- **Read-only replica** — `RunReplica` / `axwal-mirror -replica`: an exact
+  copy of a remote WAL (same record indices) that resumes from its own last
+  index, reconnects with backoff, and stops with `ErrReplicaDiverged` rather
+  than leave a hole. The directory is marked read-only: `OpenWriter` returns
+  `ErrReplicaDir` until `PromoteReplica` / `axwal-cli promote`.
+- **Synchronous replication** — `WriterOptions.SyncReplication`
+  (`Timeout`, `RecoverLag`, `Cooldown`) with `ServerOptions.Writer`: appends
+  wait for a replica's on-disk acknowledgement; on timeout or replica
+  disconnect the writer falls back to asynchronous mode and returns to
+  synchronous by itself once the replica has caught up. Stats:
+  `SyncReplicationActive`, `SyncReplicationFallbacks`,
+  `SyncReplicationWaits`, `ReplicasConnected`, `ReplicaAckedIndex`.
+- `RemoteReaderOptions.IdleTimeout` (default 60 s): a connection on which
+  the server has gone silent is dropped, so followers notice a link that
+  died without a FIN/RST.
+- Wire protocol: HELLO gained `exact` (server resets the follower's cursor
+  to the requested start index). Older servers ignore it; a replica then
+  still verifies indices and refuses to continue on a mismatch.
+
+### Fixed
+
+- `Serve`: a follower reconnecting under the same name was rejected
+  ("cursor is held by another reader") for as long as its dead previous
+  connection lingered; the new connection now evicts the old one.
+- `RemoteReader`: the connect / handshake phase is bounded by `DialTimeout`
+  end to end (SSH key exchange, tunnel dial, HELLO/OK) instead of only the
+  TCP connect.
+- SSH tunnel: the ssh-agent connection was leaked on every dial.
+
+### Changed behavior
+
+- `RemoteReader.Next` now returns an error (wrapping
+  `io.ErrUnexpectedEOF`) when the server closes the connection; it used to
+  return a bare `io.EOF`.
+
 ## v0.2.0 — 2026-10-11
 
 Built-in archiving, disk protection, non-blocking append, calendar rotation,

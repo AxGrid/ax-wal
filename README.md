@@ -606,6 +606,114 @@ trust zones via `-src-key-file` / `-dst-key-file`. The follower can be
 queried as a normal local WAL — readers register cursors as usual; the
 mirror process is the only writer.
 
+### Read-only replica
+
+Operator guide with all modes, flags and failure cases (in Russian):
+[docs/REPLICATION.md](docs/REPLICATION.md).
+
+`Mirror` copies records; a **replica** is an exact, read-only copy of the
+primary on another server — same record indices, nothing skipped, nothing
+duplicated, and nobody else can write into it.
+
+```bash
+# primary
+axwal-serve -dir /var/wal -listen 127.0.0.1:9001
+
+# neighbouring server
+axwal-mirror -replica -tunnel root@primary:22 -ssh-agent \
+    -ssh-known-hosts ~/.ssh/known_hosts \
+    -addr 127.0.0.1:9001 -dst /srv/wal-replica -name replica-1
+```
+
+or in-process: `axwal.Serve(ctx, …)` on the primary and
+`axwal.RunReplica(ctx, axwal.ReplicaOptions{Dir, Source, Writer})` on the
+other side.
+
+- **Exact.** On every (re)connect the replica asks for "my last index + 1";
+  its own WAL, not a cursor on the primary, decides where to continue. A
+  record is acknowledged to the primary only after it is on the replica's
+  disk.
+- **SSH is the transport.** The replica dials SSH itself (key file or
+  agent, `known_hosts` verification) and reaches `axwal-serve` bound to
+  `127.0.0.1` on the primary through the tunnel — nothing but sshd is
+  exposed. A direct TCP address works too (WireGuard, private network).
+- **Self-healing.** Lost connection, restarted primary, restarted sshd:
+  reconnects with backoff (1 s → 30 s) and catches up. A link that dies
+  *silently* — no FIN, data just stops — is caught too: the server pings
+  idle connections, and a replica that hears nothing for
+  `RemoteReaderOptions.IdleTimeout` (60 s) drops the connection and dials
+  again. The server lets the same replica name back in immediately,
+  evicting the stale connection.
+- **Readable.** Open a `Reader` on the replica directory like on any WAL —
+  it tails records as they arrive. Or run `axwal-serve -dir
+  /srv/wal-replica` there and attach `RemoteReader`s / further replicas.
+- **Read-only.** The directory carries a `REPLICA` marker; `OpenWriter`
+  (and therefore `restore`, `mirror`, your own service) fails with
+  `ErrReplicaDir`. Readers work as on any WAL.
+- **Never silently wrong.** If the primary has already deleted the records
+  the replica needs next, or the replica is ahead of the primary, it stops
+  with `ErrReplicaDiverged` instead of leaving a hole.
+- **Failover.** Stop the replica process, `axwal-cli promote -dir
+  /srv/wal-replica` (`axwal.PromoteReplica`), point the service at it —
+  indices continue from the last replicated record.
+
+Things to know:
+
+- **Asynchronous by default.** `Append` returns when the record is durable
+  on the primary; the replica gets it milliseconds later. Records the
+  primary hadn't shipped when its disk died are lost — unless you turn on
+  synchronous replication (next section).
+- **Keep the primary from deleting unshipped segments**: the replica's
+  cursor (`-name`) holds retention back only while its heartbeat is fresher
+  than `Retention.StaleReaderTTL` (default 60 s). Raise it to the longest
+  replica outage you want to survive, or the replica will stop with
+  `ErrReplicaDiverged` and has to be re-seeded from an empty directory.
+- Encrypted WALs are copied as stored: the replica needs no key, readers of
+  the replica need the same keys as on the primary.
+- Segment files are cut by the replica's own rotation settings; indices and
+  payloads are what match.
+
+#### Synchronous replication (opt-in)
+
+The same trade MySQL offers as semi-sync replication: an append returns
+only after a replica has the record on its disk.
+
+```go
+w, _ := axwal.OpenWriter(axwal.WriterOptions{
+    Dir: "/var/wal",
+    SyncReplication: &axwal.SyncReplicationConfig{
+        Timeout: time.Second, // longest an append may be held up
+    },
+})
+// The endpoint must live in the writer's process to pass acks to it:
+go axwal.Serve(ctx, axwal.ServerOptions{Writer: w, Listen: "127.0.0.1:9001"})
+```
+
+- `Append` = durable locally **and** acknowledged by a replica (which acks
+  after its own fsync). The wait happens outside the writer lock, so
+  concurrent appenders share replica round trips.
+- **It degrades instead of stalling.** If the replica doesn't acknowledge
+  within `Timeout`, or disconnects, the writer switches to asynchronous
+  mode: that one append returns successfully after `Timeout`, the following
+  ones don't wait at all. Nothing fails; records are still durable locally
+  and the replica keeps catching up.
+- **It recovers by itself.** When the replica is back within `RecoverLag`
+  records (default 1000) — and at least `Cooldown` (5 s) has passed since a
+  timeout fallback, so a merely slow link doesn't flap — appends wait again.
+- With no replica connected the writer is simply asynchronous.
+
+Watch it: `Stats().SyncReplicationActive`, `SyncReplicationFallbacks`,
+`ReplicasConnected`, `ReplicaAckedIndex` (lag = `LastIndex -
+ReplicaAckedIndex`). The last two are filled whenever `Serve` runs with
+`Writer` set, sync mode or not.
+
+The guarantee holds only while `SyncReplicationActive` is true: a record
+appended during a fallback window exists on the primary alone until the
+replica catches up. Cost while active: one network round trip plus the
+replica's fsync per append (per group of concurrent appends). A standalone
+`axwal-serve` process can ship records but cannot report acknowledgements
+to the writer — sync mode needs `Serve` in-process.
+
 ## Benchmarks
 
 `cmd/axwal-bench` flag matrix. 4 concurrent writer goroutines, 1 KiB

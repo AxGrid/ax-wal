@@ -92,6 +92,11 @@ type WriterOptions struct {
 	// RotateOnClose and Retention.RequireArchivedMark.
 	Archive *ArchiveConfig
 
+	// SyncReplication, if non-nil, makes appends wait for a replica's
+	// acknowledgement (semi-synchronous replication) with automatic
+	// fallback to asynchronous mode. See SyncReplicationConfig.
+	SyncReplication *SyncReplicationConfig
+
 	// AsyncQueueSize, when > 0, enables AppendAsync: a bounded in-memory
 	// queue of this many records drained by a background goroutine.
 	AsyncQueueSize int
@@ -176,6 +181,10 @@ type WriterOptions struct {
 
 	// nowFn overrides the clock in tests.
 	nowFn func() time.Time
+
+	// replica is set by RunReplica: the only writer allowed into a directory
+	// that carries the replica marker.
+	replica bool
 }
 
 // SegmentInfo describes a closed segment delivered to the OnRotate callback
@@ -365,6 +374,20 @@ type WriterStats struct {
 	// nothing left to delete.
 	DiskFull bool
 
+	// Replication, as reported by a Serve running with ServerOptions.Writer.
+	//
+	// ReplicasConnected: replica sessions currently attached.
+	// ReplicaAckedIndex: highest index a replica has confirmed on its disk;
+	// LastIndex - ReplicaAckedIndex is the replication lag in records.
+	// SyncReplicationActive: appends are currently waiting for the replica
+	// (false = asynchronous, either by configuration or after a fallback).
+	// SyncReplicationFallbacks: how many times sync mode was dropped.
+	ReplicasConnected        int
+	ReplicaAckedIndex        uint64
+	SyncReplicationActive    bool
+	SyncReplicationFallbacks uint64
+	SyncReplicationWaits     uint64
+
 	// Archive gauges/counters (zero unless WriterOptions.Archive is set).
 	//
 	// ArchivePending / ArchivePendingBytes: closed segments not yet uploaded.
@@ -429,6 +452,7 @@ type Writer struct {
 	finalizing map[segRange]struct{}
 
 	arch *archiver // non-nil iff opts.Archive is set
+	repl *replState
 
 	// diskFull is set by the janitor while a disk limit is exceeded and
 	// nothing can be deleted.
@@ -523,6 +547,10 @@ func OpenWriter(opts WriterOptions) (*Writer, error) {
 		return nil, fmt.Errorf("mkdir wal dir: %w", err)
 	}
 
+	if IsReplica(opts.Dir) && !opts.replica {
+		return nil, fmt.Errorf("%w: %s", ErrReplicaDir, opts.Dir)
+	}
+
 	lock, err := acquireWriterLock(opts.Dir)
 	if err != nil {
 		return nil, err
@@ -547,6 +575,7 @@ func OpenWriter(opts WriterOptions) (*Writer, error) {
 		cipher:    cipherInst,
 		ctx:       ctx,
 		ctxCancel: cancel,
+		repl:      newReplState(opts.SyncReplication, logger),
 	}
 
 	last, err := recover_(opts.Dir, opts.CompressOnRotate, logger)
@@ -642,6 +671,7 @@ func (w *Writer) Stats() WriterStats {
 	if w.arch != nil {
 		w.arch.fillStats(&s)
 	}
+	w.repl.fillStats(&s)
 	return s
 }
 
@@ -684,7 +714,28 @@ func (w *Writer) AppendBatch(records [][]byte) ([]uint64, error) {
 // blocks until its records are durable. ctx cancellation aborts the group-
 // commit wait (the records may still be on disk after the next commit window
 // — but the caller is told nothing about whether they were committed).
+//
+// With SyncReplication the call additionally waits — after local durability,
+// without holding the writer lock — until a replica has the records, unless
+// the writer is in (or falls back to) asynchronous mode.
 func (w *Writer) AppendBatchContext(ctx context.Context, records [][]byte) ([]uint64, error) {
+	idxs, err := w.appendBatchLocal(ctx, records)
+	if err != nil || len(idxs) == 0 {
+		return idxs, err
+	}
+	last := idxs[len(idxs)-1]
+	for {
+		cur := w.repl.last.Load()
+		if cur >= last || w.repl.last.CompareAndSwap(cur, last) {
+			break
+		}
+	}
+	w.repl.wait(ctx, last)
+	return idxs, nil
+}
+
+// appendBatchLocal writes records and makes them durable on local disk.
+func (w *Writer) appendBatchLocal(ctx context.Context, records [][]byte) ([]uint64, error) {
 	if len(records) == 0 {
 		return nil, nil
 	}

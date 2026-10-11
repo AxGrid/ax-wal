@@ -58,6 +58,8 @@ func main() {
 		cmdRestore(args)
 	case "archive":
 		cmdArchive(args)
+	case "promote":
+		cmdPromote(args)
 	case "compact":
 		cmdCompact(args)
 	case "fsck":
@@ -85,6 +87,7 @@ Subcommands:
                   -raw / -jsonl for readable payloads, -store to read an archive
   restore         append records from a JSON dump file or an archive into a target dir
   archive         list what an archive (B2 / S3 / directory) holds
+  promote         turn a read-only replica directory into a writable WAL (failover)
   compact         merge a contiguous range of closed segments into a single one
   mark-archived   touch the .archived sidecar so retention can delete the segment
 
@@ -820,6 +823,21 @@ func cmdRestore(args []string) {
 		count++
 	}
 	fmt.Printf("restored %d records into %s (lastIndex=%d)\n", count, *dir, w.LastIndex())
+}
+
+// ---------------- promote ----------------
+
+func cmdPromote(args []string) {
+	fs := flag.NewFlagSet("promote", flag.ExitOnError)
+	dir := fs.String("dir", "", "replica directory (stop axwal-mirror -replica first)")
+	fs.Parse(args)
+	if *dir == "" {
+		fatal("promote: -dir required")
+	}
+	if err := axwal.PromoteReplica(*dir); err != nil {
+		fatal("%v", err)
+	}
+	fmt.Printf("%s is now a writable WAL\n", *dir)
 }
 
 // ---------------- archive ----------------

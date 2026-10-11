@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/crypto/ssh"
@@ -51,12 +52,24 @@ type RemoteReaderOptions struct {
 	// DialTimeout for the initial TCP / SSH connect. Defaults to 15s.
 	DialTimeout time.Duration
 
+	// IdleTimeout: if nothing arrives from the server for this long — no
+	// records and no keepalive PING — the connection is considered dead and
+	// is closed, so Next returns an error instead of waiting forever. This
+	// is what catches a link that died silently (network drop, frozen SSH
+	// session). Must be comfortably above the server's KeepAliveInterval
+	// (default 15s). Default 60s.
+	IdleTimeout time.Duration
+
 	// QueueDepth bounds how many records may be buffered in memory between
 	// the network read goroutine and Next/NextBatch callers. Defaults to
 	// BatchSize * 4.
 	QueueDepth int
 
 	Logger *slog.Logger
+
+	// exact asks the server to start at StartIndex even if it remembers a
+	// different position for Name. Set by RunReplica.
+	exact bool
 }
 
 // RemoteReader reads records from a remote axwal-serve. It satisfies the
@@ -84,6 +97,8 @@ type RemoteReader struct {
 	lastAcked  uint64
 
 	headIdx uint64 // initial head from OK
+
+	lastRx atomic.Int64 // UnixNano of the last frame received
 }
 
 type recordItem struct {
@@ -110,6 +125,9 @@ func DialRemoteReader(ctx context.Context, opts RemoteReaderOptions) (*RemoteRea
 	if opts.DialTimeout <= 0 {
 		opts.DialTimeout = 15 * time.Second
 	}
+	if opts.IdleTimeout <= 0 {
+		opts.IdleTimeout = 60 * time.Second
+	}
 	if opts.QueueDepth <= 0 {
 		opts.QueueDepth = opts.BatchSize * 4
 	}
@@ -123,69 +141,103 @@ func DialRemoteReader(ctx context.Context, opts RemoteReaderOptions) (*RemoteRea
 		sshClient *ssh.Client
 		err       error
 	)
+	closeAll := func() {
+		if conn != nil {
+			_ = conn.Close()
+		}
+		if sshClient != nil {
+			_ = sshClient.Close()
+		}
+	}
 	if opts.SSHTunnel != nil {
 		sshClient, err = dialSSH(ctx, opts.SSHTunnel)
 		if err != nil {
 			return nil, fmt.Errorf("ssh dial: %w", err)
 		}
-		conn, err = sshClient.Dial("tcp", opts.Addr)
-		if err != nil {
-			_ = sshClient.Close()
-			return nil, fmt.Errorf("tunnel dial %s: %w", opts.Addr, err)
-		}
 		if opts.SSHTunnel.KnownHostsFile == "" {
 			log.Warn("SSH host-key verification DISABLED (no KnownHostsFile)",
 				"ssh_host", opts.SSHTunnel.Host)
+		}
+	}
+
+	// Everything up to the OK frame is bounded by DialTimeout (and ctx).
+	// Channels over SSH don't support deadlines, so the guard works by
+	// closing the transport, which unblocks whatever is stuck.
+	handshakeDone := make(chan struct{})
+	guardFired := make(chan struct{})
+	go func() {
+		t := time.NewTimer(opts.DialTimeout)
+		defer t.Stop()
+		select {
+		case <-handshakeDone:
+			return
+		case <-t.C:
+		case <-ctx.Done():
+		}
+		close(guardFired)
+		if sshClient != nil {
+			_ = sshClient.Close()
+		}
+	}()
+	fail := func(format string, a ...any) (*RemoteReader, error) {
+		close(handshakeDone)
+		closeAll()
+		select {
+		case <-guardFired:
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			return nil, fmt.Errorf("axwal: connecting to %s timed out after %s", opts.Addr, opts.DialTimeout)
+		default:
+		}
+		return nil, fmt.Errorf(format, a...)
+	}
+
+	if sshClient != nil {
+		conn, err = sshClient.Dial("tcp", opts.Addr)
+		if err != nil {
+			return fail("tunnel dial %s: %w", opts.Addr, err)
 		}
 	} else {
 		d := net.Dialer{Timeout: opts.DialTimeout}
 		conn, err = d.DialContext(ctx, "tcp", opts.Addr)
 		if err != nil {
-			return nil, fmt.Errorf("dial: %w", err)
+			return fail("dial: %w", err)
 		}
+		_ = conn.SetDeadline(time.Now().Add(opts.DialTimeout))
 	}
 
-	hello := helloPayload{Name: opts.Name, StartIndex: opts.StartIndex, BatchSize: opts.BatchSize}
+	hello := helloPayload{Name: opts.Name, StartIndex: opts.StartIndex, BatchSize: opts.BatchSize, Exact: opts.exact}
 	body, _ := json.Marshal(hello)
 	if err := writeFrame(conn, magicHello, body); err != nil {
-		_ = conn.Close()
-		if sshClient != nil {
-			_ = sshClient.Close()
-		}
-		return nil, fmt.Errorf("send HELLO: %w", err)
+		return fail("send HELLO: %w", err)
 	}
 	magic, body, err := readFrame(conn)
 	if err != nil {
-		_ = conn.Close()
-		if sshClient != nil {
-			_ = sshClient.Close()
-		}
-		return nil, fmt.Errorf("read OK: %w", err)
+		return fail("read OK: %w", err)
 	}
 	if magic == magicErr {
 		var ep errPayload
 		_ = json.Unmarshal(body, &ep)
-		_ = conn.Close()
-		if sshClient != nil {
-			_ = sshClient.Close()
-		}
-		return nil, fmt.Errorf("server: %s", ep.Error)
+		return fail("server: %s", ep.Error)
 	}
 	if magic != magicOK {
-		_ = conn.Close()
-		if sshClient != nil {
-			_ = sshClient.Close()
-		}
-		return nil, fmt.Errorf("expected OK, got %q", string(magic[:]))
+		return fail("expected OK, got %q", string(magic[:]))
 	}
 	if len(body) != 8 {
-		_ = conn.Close()
-		if sshClient != nil {
-			_ = sshClient.Close()
-		}
-		return nil, fmt.Errorf("malformed OK body (%d bytes)", len(body))
+		return fail("malformed OK body (%d bytes)", len(body))
 	}
 	head := binary.BigEndian.Uint64(body)
+	close(handshakeDone)
+	select {
+	case <-guardFired:
+		closeAll()
+		return nil, fmt.Errorf("axwal: connecting to %s timed out after %s", opts.Addr, opts.DialTimeout)
+	default:
+	}
+	if sshClient == nil {
+		_ = conn.SetDeadline(time.Time{})
+	}
 
 	rr := &RemoteReader{
 		opts:      opts,
@@ -197,8 +249,10 @@ func DialRemoteReader(ctx context.Context, opts RemoteReaderOptions) (*RemoteRea
 		closed:    make(chan struct{}),
 		headIdx:   head,
 	}
-	rr.wg.Add(1)
+	rr.lastRx.Store(time.Now().UnixNano())
+	rr.wg.Add(2)
 	go rr.readLoop()
+	go rr.watchdog()
 	return rr, nil
 }
 
@@ -314,14 +368,18 @@ func (rr *RemoteReader) readLoop() {
 	for {
 		magic, body, err := readFrame(rr.conn)
 		if err != nil {
-			if !errors.Is(err, io.EOF) {
-				select {
-				case rr.errCh <- err:
-				default:
-				}
+			// A clean EOF is a lost connection too (server restarted): callers
+			// following a live WAL must see it as an error and reconnect.
+			if errors.Is(err, io.EOF) {
+				err = fmt.Errorf("axwal: server closed the connection: %w", io.ErrUnexpectedEOF)
+			}
+			select {
+			case rr.errCh <- err:
+			default:
 			}
 			return
 		}
+		rr.lastRx.Store(time.Now().UnixNano())
 		switch magic {
 		case magicBatch:
 			indices, payloads, err := decodeBatch(body)
@@ -356,5 +414,36 @@ func (rr *RemoteReader) readLoop() {
 			}
 			return
 		}
+	}
+}
+
+// watchdog closes the transport when the server has been silent for longer
+// than IdleTimeout. The server pings idle connections, so silence means the
+// link is dead even if the OS hasn't noticed; closing it makes the blocked
+// read fail and the error reach Next.
+func (rr *RemoteReader) watchdog() {
+	defer rr.wg.Done()
+	t := time.NewTicker(rr.opts.IdleTimeout / 4)
+	defer t.Stop()
+	for {
+		select {
+		case <-rr.closed:
+			return
+		case <-t.C:
+		}
+		idle := time.Since(time.Unix(0, rr.lastRx.Load()))
+		if idle < rr.opts.IdleTimeout {
+			continue
+		}
+		select {
+		case rr.errCh <- fmt.Errorf("axwal: no data or keepalive from %s for %s; connection considered dead",
+			rr.opts.Addr, idle.Round(time.Millisecond)):
+		default:
+		}
+		_ = rr.conn.Close()
+		if rr.sshClient != nil {
+			_ = rr.sshClient.Close()
+		}
+		return
 	}
 }

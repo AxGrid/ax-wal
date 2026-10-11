@@ -83,6 +83,10 @@ type ReaderOptions struct {
 
 	// Logger receives reader-side log events. Defaults to slog.Default().
 	Logger *slog.Logger
+
+	// forceStart (with StartFrom == StartAt) discards an existing cursor
+	// position and starts at StartAtIndex. Used by the server for replicas.
+	forceStart bool
 }
 
 // ReaderStats is a thread-safe snapshot of reader counters/gauges.
@@ -183,7 +187,13 @@ func OpenReader(opts ReaderOptions) (*Reader, error) {
 	}
 
 	// Determine starting index.
-	if cs.rec.Index > 0 {
+	if opts.forceStart && opts.StartFrom == StartAt && opts.StartAtIndex > 0 {
+		if err := cs.reset(opts.StartAtIndex - 1); err != nil {
+			_ = cs.Close()
+			return nil, err
+		}
+		r.nextIdx.Store(opts.StartAtIndex)
+	} else if cs.rec.Index > 0 {
 		// Resume after the last Ack'd record.
 		r.nextIdx.Store(cs.rec.Index + 1)
 	} else {

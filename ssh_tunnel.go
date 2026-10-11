@@ -68,6 +68,9 @@ func dialSSH(ctx context.Context, cfg *SSHTunnelConfig) (*ssh.Client, error) {
 		if err != nil {
 			return nil, fmt.Errorf("dial ssh-agent: %w", err)
 		}
+		// Only needed for the handshake; without this every reconnect would
+		// leak one agent connection.
+		defer ac.Close()
 		ag := agent.NewClient(ac)
 		auth = append(auth, ssh.PublicKeysCallback(ag.Signers))
 	}
@@ -108,11 +111,16 @@ func dialSSH(ctx context.Context, cfg *SSHTunnelConfig) (*ssh.Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("dial ssh tcp: %w", err)
 	}
+	// ClientConfig.Timeout only covers ssh.Dial's TCP connect; bound the key
+	// exchange and auth ourselves so a peer that accepts and then goes
+	// silent can't hang the dial forever.
+	_ = tcpConn.SetDeadline(time.Now().Add(timeout))
 	c, chans, reqs, err := ssh.NewClientConn(tcpConn, cfg.Host, clientCfg)
 	if err != nil {
 		_ = tcpConn.Close()
 		return nil, fmt.Errorf("ssh handshake: %w", err)
 	}
+	_ = tcpConn.SetDeadline(time.Time{})
 	return ssh.NewClient(c, chans, reqs), nil
 }
 

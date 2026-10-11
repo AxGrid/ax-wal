@@ -17,6 +17,14 @@
 //	  -dst /local/follower \
 //	  -name follower-1
 //
+// Read-only replica on a neighbouring server: an exact copy (same record
+// indices) that reconnects by itself and that nothing else can write to.
+// After the primary is lost: stop it, `axwal-cli promote -dir /srv/wal-replica`.
+//
+//	axwal-mirror -replica -tunnel root@primary:22 -ssh-agent \
+//	  -ssh-known-hosts ~/.ssh/known_hosts \
+//	  -addr 127.0.0.1:9001 -dst /srv/wal-replica -name replica-1
+//
 // Archive source (no access to the primary at all — follows the bucket the
 // primary's archiver uploads to):
 //
@@ -52,6 +60,8 @@ func main() {
 	sshKeyPass := flag.String("ssh-key-pass", "", "passphrase for an encrypted SSH key")
 	sshAgent := flag.Bool("ssh-agent", false, "use SSH_AUTH_SOCK as an additional auth method")
 	sshKnownHosts := flag.String("ssh-known-hosts", "", "path to OpenSSH known_hosts (empty = INSECURE: skip host-key verification)")
+
+	replica := flag.Bool("replica", false, "REMOTE: keep -dst as an exact READ-ONLY replica (same indices as the primary, reconnects by itself, no other writer allowed until `axwal-cli promote`). Requires -addr and an empty or replica -dst")
 
 	// Archive source flags.
 	storeURL := flag.String("store", "", "ARCHIVE source: b2://bucket/prefix, s3://bucket/prefix?region=…&endpoint=…, file:///dir (credentials from the environment)")
@@ -151,6 +161,26 @@ func main() {
 
 	ctx, cancel := signalContext()
 	defer cancel()
+
+	if *replica {
+		if opts.SrcRemote == nil {
+			log.Fatalf("axwal-mirror: -replica needs a remote source (-addr, optionally -tunnel)")
+		}
+		if *statusEvery > 0 {
+			go statusLoop(ctx, opts, *statusEvery)
+		}
+		log.Printf("replica: %s → %s (cursor=%s, read-only)", *addr, *dst, *name)
+		err := axwal.RunReplica(ctx, axwal.ReplicaOptions{
+			Dir:    *dst,
+			Source: *opts.SrcRemote,
+			Writer: opts.DstWriterOptions,
+		})
+		if err != nil {
+			log.Fatalf("replica: %v", err)
+		}
+		log.Printf("replica: stopped")
+		return
+	}
 
 	if *statusEvery > 0 {
 		go statusLoop(ctx, opts, *statusEvery)

@@ -38,6 +38,13 @@ type ServerOptions struct {
 	// follower acks.
 	AckBatchInterval time.Duration
 
+	// Writer, when the WAL is written by this same process, connects the
+	// server to it: replica acknowledgements reach the writer directly,
+	// which is what WriterOptions.SyncReplication waits for and what
+	// WriterStats' replication fields report. Dir defaults to the writer's
+	// directory.
+	Writer *Writer
+
 	// Logger receives server events. Defaults to slog.Default().
 	Logger *slog.Logger
 }
@@ -46,6 +53,13 @@ type ServerOptions struct {
 // Each accepted connection gets its own goroutine and its own Reader on the
 // source WAL (cursor name = the follower's HELLO.Name).
 func Serve(ctx context.Context, opts ServerOptions) error {
+	if opts.Writer != nil {
+		if opts.Dir == "" {
+			opts.Dir = opts.Writer.dir
+		} else if opts.Dir != opts.Writer.dir {
+			return errors.New("axwal: ServerOptions.Dir differs from ServerOptions.Writer's directory")
+		}
+	}
 	if opts.Dir == "" {
 		return errors.New("axwal: ServerOptions.Dir required")
 	}
@@ -75,6 +89,7 @@ func Serve(ctx context.Context, opts ServerOptions) error {
 		_ = ln.Close()
 	}()
 
+	sessions := &serverSessions{byName: map[string]*serverSession{}}
 	var wg sync.WaitGroup
 	for {
 		conn, err := ln.Accept()
@@ -88,12 +103,44 @@ func Serve(ctx context.Context, opts ServerOptions) error {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			handleConn(ctx, opts, conn, log)
+			handleConn(ctx, opts, conn, log, sessions)
 		}()
 	}
 }
 
-func handleConn(ctx context.Context, opts ServerOptions, conn net.Conn, baseLog *slog.Logger) {
+// serverSessions tracks the live connection per follower name. A follower
+// that reconnects after its link died silently finds its old connection
+// still "alive" on this side (the kernel hasn't given up on it yet) and
+// still holding the cursor; the newest connection wins and evicts it.
+type serverSessions struct {
+	mu     sync.Mutex
+	byName map[string]*serverSession
+}
+
+type serverSession struct {
+	conn net.Conn
+	done chan struct{} // closed when the handler has released the cursor
+}
+
+// take registers s under name and returns the session it replaces, if any.
+func (ss *serverSessions) take(name string, s *serverSession) *serverSession {
+	ss.mu.Lock()
+	defer ss.mu.Unlock()
+	old := ss.byName[name]
+	ss.byName[name] = s
+	return old
+}
+
+func (ss *serverSessions) release(name string, s *serverSession) {
+	ss.mu.Lock()
+	if ss.byName[name] == s {
+		delete(ss.byName, name)
+	}
+	ss.mu.Unlock()
+	close(s.done)
+}
+
+func handleConn(ctx context.Context, opts ServerOptions, conn net.Conn, baseLog *slog.Logger, sessions *serverSessions) {
 	defer conn.Close()
 	log := baseLog.With("peer", conn.RemoteAddr().String())
 
@@ -121,6 +168,18 @@ func handleConn(ctx context.Context, opts ServerOptions, conn net.Conn, baseLog 
 	}
 	log = log.With("follower", hello.Name)
 
+	sess := &serverSession{conn: conn, done: make(chan struct{})}
+	if old := sessions.take(hello.Name, sess); old != nil {
+		log.Info("follower reconnected; dropping its previous connection",
+			"old_peer", old.conn.RemoteAddr().String())
+		_ = old.conn.Close()
+		select {
+		case <-old.done:
+		case <-time.After(10 * time.Second):
+		}
+	}
+	defer sessions.release(hello.Name, sess)
+
 	rOpts := ReaderOptions{
 		Dir:               opts.Dir,
 		Name:              hello.Name,
@@ -134,6 +193,7 @@ func handleConn(ctx context.Context, opts ServerOptions, conn net.Conn, baseLog 
 	} else {
 		rOpts.StartFrom = StartAt
 		rOpts.StartAtIndex = hello.StartIndex
+		rOpts.forceStart = hello.Exact
 	}
 	r, err := OpenReader(rOpts)
 	if err != nil {
@@ -146,6 +206,15 @@ func handleConn(ctx context.Context, opts ServerOptions, conn net.Conn, baseLog 
 	if err := sendOK(conn, head); err != nil {
 		log.Warn("send OK failed", "err", err)
 		return
+	}
+
+	// A replica's position is authoritative from its HELLO on: it holds
+	// everything below StartIndex.
+	var repl *replState
+	if opts.Writer != nil && hello.Exact && hello.StartIndex > 0 {
+		repl = opts.Writer.repl
+		repl.replicaConnected(hello.StartIndex - 1)
+		defer repl.replicaDisconnected()
 	}
 
 	// Connection-scoped serializer for writes (BATCH and PING).
@@ -173,6 +242,9 @@ func handleConn(ctx context.Context, opts ServerOptions, conn net.Conn, baseLog 
 				return
 			}
 			idx := binary.BigEndian.Uint64(b)
+			if repl != nil {
+				repl.replicaAcked(idx)
+			}
 			if err := r.Ack(idx); err != nil {
 				log.Warn("source ack failed", "err", err, "idx", idx)
 				return
