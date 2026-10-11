@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 
 	"github.com/klauspost/compress/zstd"
 )
@@ -40,6 +41,14 @@ func recover_(dir string, compressOnRotate bool, log *slog.Logger) (uint64, erro
 		if base == writerLockFile {
 			continue
 		}
+		if isSegmentSidecar(base) {
+			continue
+		}
+		if strings.HasSuffix(base, ".zst"+compressTmpSuffix) {
+			// Compression interrupted by a crash; the source segment is intact.
+			_ = os.Remove(p)
+			continue
+		}
 		s, err := parseSegName(base)
 		if err != nil {
 			log.Warn("recovery: skipping unrecognized file", "name", base, "err", err)
@@ -49,6 +58,23 @@ func recover_(dir string, compressOnRotate bool, log *slog.Logger) (uint64, erro
 			closed = append(closed, s)
 		} else {
 			open = append(open, s)
+		}
+	}
+
+	// A crash between "wal-F-L.zst renamed into place" and "wal-F-L removed"
+	// leaves both forms. The .zst is complete (it is renamed atomically), so
+	// the uncompressed twin is redundant.
+	zst := map[segRange]bool{}
+	for _, s := range closed {
+		if s.Compression != "" {
+			zst[segRange{s.FirstIndex, s.LastIndex}] = true
+		}
+	}
+	for _, s := range closed {
+		if s.Compression == "" && zst[segRange{s.FirstIndex, s.LastIndex}] {
+			if err := os.Remove(filepath.Join(dir, s.Name)); err == nil {
+				log.Info("recovery: removed uncompressed twin of compressed segment", "name", s.Name)
+			}
 		}
 	}
 
@@ -195,6 +221,14 @@ func (c *countingReader) Read(p []byte) (int, error) {
 }
 
 func base(p string) string { return filepath.Base(p) }
+
+// isSegmentSidecar reports whether name is a per-segment sidecar
+// (.archived / .meta) rather than a segment file.
+func isSegmentSidecar(name string) bool {
+	return strings.HasSuffix(name, archivedSidecarSuffix) ||
+		strings.HasSuffix(name, metaSidecarSuffix) ||
+		strings.HasSuffix(name, metaSidecarSuffix+".tmp")
+}
 
 // _ keeps zstd referenced so go vet doesn't complain on the unused-import path
 // when CompressOnRotate is false. Import is needed by recovery's compress branch.

@@ -43,17 +43,19 @@ func (w *Writer) commitLoop() {
 	}
 }
 
-// rotateAgeLoop fires Rotate() when the active segment exceeds MaxSegmentAge.
-// Cheap polling (every MaxSegmentAge/4, capped 1s..5s) is fine here: rotation
-// is rare relative to writes.
+// rotateAgeLoop fires rotations that depend on the clock rather than on
+// writes: MaxSegmentAge (segment open for too long) and RotateAligned (a
+// wall-clock boundary passed, so an idle segment doesn't stay open into the
+// next window). Cheap polling is fine here: rotation is rare relative to
+// writes.
 func (w *Writer) rotateAgeLoop() {
 	defer w.rotateAgeWG.Done()
-	period := w.opts.MaxSegmentAge / 4
-	switch {
-	case period < time.Second:
+	period := 5 * time.Second
+	if age := w.opts.MaxSegmentAge; age > 0 && age/4 < period {
+		period = age / 4
+	}
+	if period < time.Second || w.opts.RotateAligned > 0 {
 		period = time.Second
-	case period > 5*time.Second:
-		period = 5 * time.Second
 	}
 	t := time.NewTicker(period)
 	defer t.Stop()
@@ -67,9 +69,11 @@ func (w *Writer) rotateAgeLoop() {
 				w.mu.Unlock()
 				continue
 			}
-			if time.Since(w.openedAt) >= w.opts.MaxSegmentAge {
+			now := w.opts.nowFn()
+			byAge := w.opts.MaxSegmentAge > 0 && now.Sub(w.openedAt) >= w.opts.MaxSegmentAge
+			if byAge || w.crossedBoundaryLocked(now) {
 				if err := w.rotateLocked(); err != nil {
-					w.log.Error("age-based rotation failed", "err", err)
+					w.log.Error("time-based rotation failed", "err", err)
 				}
 			}
 			w.mu.Unlock()

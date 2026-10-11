@@ -155,13 +155,9 @@ func OpenReader(opts ReaderOptions) (*Reader, error) {
 	}
 	logger := opts.Logger.With("component", "axwal.reader", "dir", opts.Dir, "name", opts.Name)
 
-	var cipherInst *cipherAEAD
-	if opts.Encryption != nil {
-		c, err := newCipher(opts.Encryption.Key)
-		if err != nil {
-			return nil, err
-		}
-		cipherInst = c
+	cipherInst, err := newCipherFromConfig(opts.Encryption)
+	if err != nil {
+		return nil, err
 	}
 
 	cs, err := openCursor(opts.Dir, opts.Name)
@@ -660,26 +656,32 @@ func (r *Reader) scanLastIndex() (uint64, error) {
 	if len(segs) == 0 {
 		return 0, nil
 	}
-	// Prefer a closed segment with the highest LastIndex.
-	var have bool
+	// Highest LastIndex among closed segments...
 	var best uint64
 	for _, s := range segs {
-		if s.Closed && (!have || s.LastIndex > best) {
+		if s.Closed && s.LastIndex > best {
 			best = s.LastIndex
-			have = true
 		}
 	}
-	if have {
+	// ...extended by the open segment, whose real tail needs a CRC walk.
+	last := segs[len(segs)-1]
+	if last.Closed || last.FirstIndex <= best {
 		return best, nil
 	}
-	// Otherwise scan the open segment to find its real tail.
-	last := segs[len(segs)-1]
-	if last.Closed {
-		return last.LastIndex, nil
+	idx, _, err := readOpenSegmentTail(filepath.Join(r.dir, last.Name), last.FirstIndex, discardLog)
+	if err != nil {
+		return 0, err
 	}
-	idx, _, err := readOpenSegmentTail(filepath.Join(r.dir, last.Name), last.FirstIndex, r.log)
-	return idx, err
+	if idx > best {
+		best = idx
+	}
+	return best, nil
 }
+
+// discardLog silences helpers that log recovery-style warnings when they are
+// used for read-only probing (a partial frame at the tail of a live open
+// segment is normal there).
+var discardLog = slog.New(slog.NewTextHandler(io.Discard, nil))
 
 // notifier wraps fsnotify with a channel that emits at most one event per dir
 // activity wave. If fsnotify can't watch the dir, we degrade to nil and rely on

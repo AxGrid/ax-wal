@@ -26,24 +26,35 @@ producer ──► [writer fsync ─► segment file] ─► fsnotify ─► [re
 - **Tail-and-follow.** `Reader.Next(ctx)` blocks until new records arrive;
   uses fsnotify with a polling fallback. `Reader.NextBatch(ctx, max)` for
   amortizing per-record overhead.
-- **Auto-rotation.** By size, by age, by record count — any combination.
+- **Auto-rotation.** By size, by age, by record count, on wall-clock
+  boundaries (`RotateAligned`: every hour at :00, daily at 00:00) — any
+  combination.
 - **Cursor-aware retention** with optional time-based hard-purge
   (`MaxRetainAge`). Stale readers (heartbeat older than TTL) are excluded
   from the cursor floor so one dead consumer can't fill the disk.
-- **Archive gate.** Optionally require an external uploader (S3 / B2 / cold
-  storage) to drop a `wal-F-L.archived` sidecar before retention reclaims
-  the local copy.
+- **Built-in archiver.** Set `WriterOptions.Archive` and every closed
+  segment is streamed to Backblaze B2 / S3 / a directory, verified, retried
+  on failure, and only then marked `.archived` for retention. A manifest in
+  the bucket catalogs index ranges, record times, checksums and key
+  fingerprints; `OpenArchiveReader` reads records straight back from it.
+- **Disk protection.** `MinRetainAge` keeps segments locally for N days,
+  `MaxTotalBytes` / `MinFreeBytes` evict the oldest archived ones under
+  pressure, and a configurable policy decides what `Append` does when
+  nothing can be deleted.
+- **Non-blocking append.** `AppendAsync` puts a record in a bounded queue
+  and returns; overflow is dropped and counted.
 - **Tunable durability.** `SyncFull` / `SyncBarrier` / `SyncNone` — pick the
   trade-off between latency, throughput, and survivability of last-second
   writes. Pair with `GroupCommit` to amortize fsync cost across concurrent
   writers; on the read side `AckBatchInterval` does the same for cursor
   fsyncs (~1.7 M reads/s in our bench when both sides are batched).
-- **Optional encryption-at-rest** via AES-256-GCM. Bring-your-own-key.
+- **Optional encryption-at-rest** via AES-256-GCM. Bring-your-own-key,
+  rotate it without stopping the writer.
 - **Optional `mmap` reads** for huge cold replays.
 - **Built-in replication.** `axwal.Mirror(ctx, ...)` library + `axwal-mirror`
   binary copy a primary WAL to a follower in real time.
 - **Operational tooling.** `axwal-cli ls / cursors / stats / verify / fsck /
-  dump / restore / compact / tail / mark-archived`.
+  dump / restore / compact / tail / mark-archived / archive`.
 - **Stats and structured logging.** `Writer.Stats()` / `Reader.Stats()`
   return atomic counters; logs go through `*slog.Logger` with `dir` and
   reader `name` keys on every line.
@@ -99,6 +110,13 @@ type WriterOptions struct {
     MaxSegmentSize      int64
     MaxSegmentAge       time.Duration
     MaxSegmentRecords   uint64
+    RotateAligned       time.Duration // wall-clock rotation: time.Hour, 24*time.Hour
+    RotateLocation      *time.Location // zone for RotateAligned, default UTC
+    RotateOnClose       bool          // Close() finishes the last segment like a rotation
+    Archive             *ArchiveConfig // built-in uploader, see "Archiving"
+    AsyncQueueSize      int           // > 0 enables AppendAsync
+    AsyncQueueBytes     int64         // optional byte bound for the async queue
+    AsyncBatchSize      int           // records per background write, default 256
     PreallocateSegments bool          // fallocate / F_PREALLOCATE
     CompressOnRotate    bool          // async zstd
     OnRotate            func(SegmentInfo)
@@ -186,7 +204,11 @@ type RetentionConfig struct {
     MinRetainRecords     uint64
     StaleReaderTTL       time.Duration  // default 60s
     RequireArchivedMark  bool           // gate on wal-F-L.archived sidecar
+    MinRetainAge         time.Duration  // keep locally at least this long
     MaxRetainAge         time.Duration  // hard purge by age (compliance)
+    MaxTotalBytes        int64          // cap on the directory size
+    MinFreeBytes         int64          // …or on free space of the filesystem
+    OnDiskFull           DiskFullPolicy // Reject (default) | Drop | Ignore
 }
 ```
 
@@ -194,13 +216,199 @@ A closed segment is deleted iff:
 
 1. **Cursor cutoff:** all non-stale cursors have advanced past it.
 2. **`MinRetainRecords` floor** is satisfied (keep last N records always).
-3. **OR `MaxRetainAge` expired** — segment older than this is deleted
+3. **`MinRetainAge` has passed** — without it, a WAL nobody reads from
+   loses its closed segments on the next janitor pass.
+4. **OR `MaxRetainAge` expired** — segment older than this is deleted
    regardless of cursors. Pair with a documented consumer SLO.
-4. **If `RequireArchivedMark`** is set, a sibling `wal-F-L.archived` must
-   also exist. Use `Writer.MarkArchived(F, L)` from your in-process archiver,
-   or `axwal-cli mark-archived` from a separate uploader.
+5. **If `RequireArchivedMark`** is set (implied by `Archive`), a sibling
+   `wal-F-L.archived` must also exist. The built-in archiver writes it;
+   with your own uploader use `Writer.MarkArchived(F, L)` or
+   `axwal-cli mark-archived`.
+
+So "keep 7 days locally, never drop what isn't in the bucket yet, purge at
+30 days no matter what" is:
+
+```go
+Retention: axwal.RetentionConfig{
+    Enabled:      true,
+    MinRetainAge: 7 * 24 * time.Hour,
+    MaxRetainAge: 30 * 24 * time.Hour,
+},
+```
 
 The active open segment is never touched.
+
+#### Disk limits
+
+`MaxTotalBytes` caps the size of the segment files; `MinFreeBytes` watches
+the filesystem instead. When either is violated the janitor evicts the
+oldest closed segments first, **ignoring `MinRetainAge` and
+`MinRetainRecords`** — but never a segment that still waits for its
+`.archived` mark, and never one a live reader hasn't consumed. Limits are
+checked every `Interval` and after each rotation / upload, so leave about
+one segment of headroom.
+
+If the limit is exceeded and nothing may be deleted (archive unreachable,
+foreign files filling the disk), `OnDiskFull` decides:
+
+| Policy | `Append` | Counter |
+|---|---|---|
+| `DiskFullReject` (default) | returns `ErrDiskFull` | `Stats().DiskFullRejects` |
+| `DiskFullDrop` | discards, returns `nil` (index 0) | `Stats().Dropped` |
+| `DiskFullIgnore` | keeps writing | — |
+
+`Stats().DiskFull` shows the current state. Writes resume by themselves as
+soon as a pass gets back under the limit.
+
+### Archiving
+
+```go
+import "github.com/axgrid/ax-wal/store/b2store"
+
+w, err := axwal.OpenWriter(axwal.WriterOptions{
+    Dir:              "/var/wal",
+    CompressOnRotate: true,
+    RotateAligned:    time.Hour,              // segments never span two hours
+    Archive: &axwal.ArchiveConfig{
+        Store:        b2store.New(keyID, appKey, bucket),
+        Prefix:       "wal/kiosk-prod",
+        Layout:       axwal.LayoutByDay,      // <prefix>/2026/10/11/wal-F-L.zst
+        Concurrency:  2,
+        Retry:        axwal.Backoff{Min: 5 * time.Second, Max: 10 * time.Minute},
+        DrainOnClose: 20 * time.Second,       // Close waits for the last upload
+    },
+    Retention: axwal.RetentionConfig{Enabled: true, MinRetainAge: 7 * 24 * time.Hour},
+})
+```
+
+What the archiver does:
+
+- **Uploads every closed segment after compression** — it takes segments
+  when they leave the rotation pipeline, not at `OnRotate` time.
+- **Verifies before marking.** SHA-1 and SHA-256 are computed locally and
+  sent with the upload (B2 checks the SHA-1, S3 the SHA-256 of the request
+  body); afterwards the object is looked up in the store and its size (and
+  SHA-1, where the backend reports one) compared. Only then is
+  `wal-F-L.archived` written.
+- **Retries forever** with `Retry` backoff. A segment stays pending until
+  it is marked; every step is idempotent, so a retry re-sends nothing that
+  already arrived and never produces a second object.
+- **Picks up leftovers on open.** Pending = "closed segment without
+  `.archived`", so segments from a previous run — including one finalized
+  by crash recovery — are uploaded when the writer starts.
+- **Streams.** Nothing is read into memory whole: a single PUT streams from
+  the file, and anything above 128 MiB goes through B2 large-file / S3
+  multipart, each part read directly from the file.
+- **Keeps a manifest** at `<prefix>/manifest.json` (see below).
+
+`Archive` implies `WriteMetaSidecar`, `RotateOnClose` and
+`Retention.RequireArchivedMark`.
+
+Stores:
+
+| Package | Backend |
+|---|---|
+| `store/b2store` | Backblaze B2 native API — `b2store.New(keyID, appKey, bucket)` |
+| `store/s3store` | S3 and compatibles (AWS, MinIO, R2, B2's S3 endpoint), SigV4 — `s3store.New(s3store.Config{…})` |
+| `store/fsstore` | a local / mounted directory — `fsstore.New(dir)` |
+| `store/storeurl` | opens any of the above from `b2://bucket/prefix`, `s3://bucket/prefix?region=…&endpoint=…`, `file:///dir`, with credentials from the environment (used by the CLIs) |
+
+None of them pulls in an SDK. To plug in your own, implement three methods:
+
+```go
+type ArchiveStore interface {
+    Put(ctx context.Context, key string, body io.Reader, info ArchivePutInfo) error
+    Get(ctx context.Context, key string) (io.ReadCloser, error) // ErrObjectNotFound if missing
+    List(ctx context.Context, prefix string) ([]ArchiveObject, error)
+}
+```
+
+#### Manifest
+
+`<prefix>/manifest.json` is rewritten after every upload and lists each
+segment with its object key, index range, record count, size, SHA-1 /
+SHA-256, compression, **time of the first and last record**, and the
+**fingerprint of the encryption key** (`axwal.KeyFingerprint(key)`).
+`axwal.LoadArchiveManifest(ctx, store, prefix)` returns it; if an archive
+has no manifest it is reconstructed from a listing (times then come from
+object modification times).
+
+```bash
+axwal-cli archive -store b2://bucket/wal/kiosk-prod          # table
+axwal-cli archive -store b2://bucket/wal/kiosk-prod -json    # the manifest
+```
+
+The same record times and key fingerprint are in the local `wal-F-L.meta`
+sidecar.
+
+#### Reading from the archive
+
+```go
+r, err := axwal.OpenArchiveReader(ctx, axwal.ArchiveReaderOptions{
+    Store:    store,
+    Prefix:   "wal/kiosk-prod",
+    FromTime: time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC),
+    ToTime:   time.Date(2026, 9, 30, 23, 59, 59, 0, time.UTC),
+    // or FromIndex / ToIndex
+})
+for {
+    payload, idx, err := r.Next(ctx)
+    if err == io.EOF { break }
+    …
+}
+```
+
+It needs nothing but the bucket: segments are downloaded one at a time to a
+temp file, checked against the manifest, decompressed and decrypted.
+Records carry no timestamps, so the time filter selects whole segments —
+with `RotateAligned` that is exactly one rotation window. From the shell:
+
+```bash
+axwal-cli dump    -store b2://bucket/wal/kiosk-prod -since 2026-09-01 -until 2026-09-30 -raw
+axwal-cli restore -store b2://bucket/wal/kiosk-prod -from 1 -to 50000 -dir /tmp/wal-copy
+axwal-mirror      -store b2://bucket/wal/kiosk-prod -dst /srv/wal-copy   # follows new uploads
+```
+
+`axwal-mirror -store` (library: `MirrorOptions.SrcArchive`) replays the
+archive into a local WAL and then keeps polling for new segments; its
+position survives restarts in `<dst>/archive-mirror.pos`.
+
+### Calendar rotation
+
+`MaxSegmentAge` counts from the moment a segment was opened.
+`RotateAligned` rotates on the clock instead: `time.Hour` cuts at every
+:00, `24 * time.Hour` at 00:00 in `RotateLocation` (UTC by default). The
+check happens on the write path, so a segment only ever contains records
+appended within one window; an idle segment is closed by a timer within a
+second of the boundary. With `LayoutByDay` the directory an object lands in
+is therefore the day its records were written, not the day the file
+happened to be closed.
+
+### Non-blocking append
+
+```go
+w, _ := axwal.OpenWriter(axwal.WriterOptions{Dir: dir, AsyncQueueSize: 8192})
+
+if err := w.AppendAsync(payload); err != nil {
+    // ErrQueueFull: dropped (already counted in Stats().Dropped)
+}
+```
+
+`AppendAsync` never waits for disk: it hands the record to a bounded queue
+that a background goroutine writes out in batches. When the queue is full
+(by `AsyncQueueSize` records or `AsyncQueueBytes`) the record is dropped
+and counted. `Close()` writes out whatever is queued. Queued records are
+not durable yet — use `Append` where that matters; both can be mixed on one
+writer.
+
+### Closing
+
+`Close()` by default only renames the last segment to its closed form.
+With `RotateOnClose` (implied by `Archive`) it runs the full rotation
+pipeline on it — compression, `.meta`, `OnRotate` — so the tail is ready
+for upload the moment the service stops, without a manual `Rotate()`.
+`Archive.DrainOnClose` additionally waits that long for pending uploads.
+`CloseTimeout` caps the whole shutdown; without it the pipeline gets 30 s.
 
 ### OnRotate, .meta sidecars, archived sidecars
 
@@ -234,9 +442,20 @@ A reader without the key can scan framing (`verify`, `ls` work fine) but
 gets `ErrEncryption` when it tries to read a record. Mismatched key →
 `ErrEncryption`.
 
-CLI tools accept `-key-file path/to/key` (raw 32 bytes). No key rotation in
-this version — re-key by running `axwal-mirror` from old to new with
-different `-src-key-file` / `-dst-key-file`.
+CLI tools accept `-key-file path/to/key` (raw 32 bytes).
+
+**Key rotation.** `w.RotateKey(newKey)` rotates the active segment and
+seals everything after it with the new key — no restart, and every segment
+uses exactly one key. Readers take the current key plus the earlier ones:
+
+```go
+Encryption: &axwal.EncryptionConfig{Key: current, OldKeys: [][]byte{previous}}
+```
+
+The right key is picked per record by GCM authentication. To know which key
+a year-old segment needs without trying, each segment's `.meta` sidecar and
+its manifest entry carry `key_fingerprint` — compare with
+`axwal.KeyFingerprint(key)`. (`axwal-cli dump -key-file … -old-key-files a,b`.)
 
 ### Reader.Lag / Reader.HeadIndex
 
@@ -492,8 +711,17 @@ go run ./cmd/axwal-cli stats -dir /tmp/wal
 go run ./cmd/axwal-cli verify -dir /tmp/wal
 go run ./cmd/axwal-cli fsck -dir /tmp/wal --fix
 go run ./cmd/axwal-cli tail -dir /tmp/wal -name dbg [-key-file key.bin]
-go run ./cmd/axwal-cli dump -dir /tmp/wal -from 1 -to 100 > dump.json
+go run ./cmd/axwal-cli dump -dir /tmp/wal -from 1 -to 100 > dump.json   # stops at the last record
+go run ./cmd/axwal-cli dump -dir /tmp/wal -raw                          # payloads as is, one per line
+go run ./cmd/axwal-cli dump -dir /tmp/wal -jsonl                        # {"idx":1,"payload":{…}}
+go run ./cmd/axwal-cli dump -dir /tmp/wal -follow                       # keep tailing
 go run ./cmd/axwal-cli restore -dir /tmp/wal2 -src dump.json
+
+# Archive (credentials: B2_KEY_ID/B2_APP_KEY or AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY)
+go run ./cmd/axwal-cli archive -store b2://bucket/wal/prod
+go run ./cmd/axwal-cli dump    -store b2://bucket/wal/prod -since 2026-09-01 -until 2026-09-30 -raw
+go run ./cmd/axwal-cli restore -store s3://bucket/wal/prod?region=eu-central-1 -dir /tmp/wal2
+go run ./cmd/axwal-mirror      -store b2://bucket/wal/prod -dst /srv/wal-copy
 go run ./cmd/axwal-cli compact -dir /tmp/wal -range 1-1000
 go run ./cmd/axwal-cli mark-archived -dir /tmp/wal -range 1-1000
 ```
@@ -505,8 +733,9 @@ go run ./cmd/axwal-cli mark-archived -dir /tmp/wal -range 1-1000
   .writer.lock              flock + PID of the live writer (POSIX advisory lock)
   wal-1-1000                closed segment, indices 1..1000 inclusive
   wal-1001-2000.zst         closed + zstd-compressed
-  wal-1001-2000.archived    sidecar dropped by an external uploader (optional)
-  wal-1001-2000.meta        rotation metadata (sha256, num_records, …) optional
+  wal-1001-2000.archived    "safely uploaded" mark: the built-in archiver or an external uploader
+  wal-1001-2000.meta        rotation metadata (sha256, num_records, first/last
+                            record time, key fingerprint) optional
   wal-2001-                 active segment (writer is appending)
   cursors/
     billing-worker-1.cursor   [magic][crc32c][JSON cursor record]
@@ -532,7 +761,10 @@ renames the file to its proper closed form.
 ```go
 ws := w.Stats()  // LastIndex, CommitIndex, FsyncCalls, FsyncErrors,
                  // Rotations, AppendCalls, AppendBytes,
-                 // BackpressureRejects, RetentionDeletes, …
+                 // BackpressureRejects, RetentionDeletes,
+                 // Dropped, AsyncQueued, AsyncErrors, DiskFull, DiskFullRejects,
+                 // ArchivePending, ArchivePendingBytes, ArchiveOldestPendingAge,
+                 // ArchiveLastSuccess, ArchiveUploads, ArchiveErrors, …
 rs := r.Stats()  // NextIndex, AckedIndex, NextCalls, AckCalls,
                  // SegmentSwitches, ErrCorruptSegs, WaitWakeups
 ```

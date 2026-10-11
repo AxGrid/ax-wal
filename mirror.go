@@ -4,8 +4,47 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
 	"time"
 )
+
+// archiveMirrorPosFile holds the last source index an archive mirror has
+// written to its destination.
+const archiveMirrorPosFile = "archive-mirror.pos"
+
+// archiveMirrorSource is an ArchiveReader whose Ack persists the position
+// locally (an archive has no server-side cursor).
+type archiveMirrorSource struct {
+	*ArchiveReader
+	posPath string
+}
+
+func (s *archiveMirrorSource) Ack(idx uint64) error {
+	tmp := s.posPath + ".tmp"
+	if err := os.WriteFile(tmp, []byte(strconv.FormatUint(idx, 10)+"\n"), 0644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, s.posPath)
+}
+
+func readArchiveMirrorPos(path string) (uint64, error) {
+	b, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	pos, err := strconv.ParseUint(strings.TrimSpace(string(b)), 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("parse %s: %w", path, err)
+	}
+	return pos, nil
+}
 
 const defaultMirrorAckBatch = 100 * time.Millisecond
 
@@ -23,6 +62,14 @@ type MirrorOptions struct {
 	// SrcRemote, when non-nil, makes the mirror pull records from a remote
 	// axwal-serve over the wire protocol. SrcRemote.Name overrides Name below.
 	SrcRemote *RemoteReaderOptions
+
+	// SrcArchive, when non-nil, makes the mirror follow an archive (object
+	// storage) instead of a live WAL: it replays what is there and then keeps
+	// picking up segments as the archiver uploads them. Follow is forced on.
+	// The position is kept in <DstDir>/archive-mirror.pos, so a restart
+	// resumes where it stopped; FromIndex only applies to the first run.
+	// Mutually exclusive with SrcDir and SrcRemote.
+	SrcArchive *ArchiveReaderOptions
 
 	// DstDir is the destination WAL directory. Required.
 	DstDir string
@@ -69,8 +116,18 @@ func Mirror(ctx context.Context, opts MirrorOptions) (int64, error) {
 	if opts.DstDir == "" {
 		return 0, errors.New("axwal: Mirror.DstDir required")
 	}
-	if (opts.SrcDir == "") == (opts.SrcRemote == nil) {
-		return 0, errors.New("axwal: Mirror requires exactly one of SrcDir or SrcRemote")
+	sources := 0
+	if opts.SrcDir != "" {
+		sources++
+	}
+	if opts.SrcRemote != nil {
+		sources++
+	}
+	if opts.SrcArchive != nil {
+		sources++
+	}
+	if sources != 1 {
+		return 0, errors.New("axwal: Mirror requires exactly one of SrcDir, SrcRemote or SrcArchive")
 	}
 	if opts.SrcDir != "" && opts.SrcDir == opts.DstDir {
 		return 0, errors.New("axwal: Mirror SrcDir and DstDir must differ")
@@ -81,7 +138,23 @@ func Mirror(ctx context.Context, opts MirrorOptions) (int64, error) {
 	}
 
 	var src recordSource
-	if opts.SrcRemote != nil {
+	if opts.SrcArchive != nil {
+		ao := *opts.SrcArchive
+		ao.Follow = true
+		posPath := filepath.Join(opts.DstDir, archiveMirrorPosFile)
+		pos, err := readArchiveMirrorPos(posPath)
+		if err != nil {
+			return 0, fmt.Errorf("mirror: %w", err)
+		}
+		if pos > 0 {
+			ao.FromIndex = pos + 1
+		}
+		ar, err := OpenArchiveReader(ctx, ao)
+		if err != nil {
+			return 0, fmt.Errorf("mirror: open archive: %w", err)
+		}
+		src = &archiveMirrorSource{ArchiveReader: ar, posPath: posPath}
+	} else if opts.SrcRemote != nil {
 		ro := *opts.SrcRemote
 		if ro.BatchSize <= 0 {
 			ro.BatchSize = batch
@@ -127,6 +200,10 @@ func Mirror(ctx context.Context, opts MirrorOptions) (int64, error) {
 		payloads, indices, err := src.NextBatch(ctx, batch)
 		if err != nil {
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return mirrored, nil
+			}
+			if errors.Is(err, io.EOF) {
+				// Bounded archive source (ToIndex / ToTime) fully replayed.
 				return mirrored, nil
 			}
 			return mirrored, fmt.Errorf("mirror: read: %w", err)

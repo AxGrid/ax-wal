@@ -5,6 +5,9 @@
 //	axwal-cli verify -dir /path/to/wal          # CRC-walk every segment
 //	axwal-cli tail -dir /path/to/wal -name dbg  # follow live (Ctrl-C to stop)
 //	axwal-cli mark-archived -dir X -range 1-100 # touch wal-1-100.archived
+//	axwal-cli dump -dir X -from 1 -to 100 -jsonl # records with readable payloads
+//	axwal-cli archive -store b2://bucket/prefix # what the archive holds
+//	axwal-cli dump -store b2://bucket/prefix -since 2026-09-01 -until 2026-09-30 -raw
 package main
 
 import (
@@ -25,6 +28,7 @@ import (
 	"time"
 
 	axwal "github.com/axgrid/ax-wal"
+	"github.com/axgrid/ax-wal/store/storeurl"
 	"github.com/klauspost/compress/zstd"
 )
 
@@ -52,6 +56,8 @@ func main() {
 		cmdDump(args)
 	case "restore":
 		cmdRestore(args)
+	case "archive":
+		cmdArchive(args)
 	case "compact":
 		cmdCompact(args)
 	case "fsck":
@@ -75,8 +81,10 @@ Subcommands:
   verify          CRC-scan every segment, report bad records
   fsck            verify + remove bad segments and dedupe twins (--fix to apply)
   tail            follow the WAL live (registers a temporary cursor)
-  dump            print records in a range as JSON {idx, len, payload_base64}
-  restore         append records from a JSON dump file into a target dir
+  dump            print records in a range as JSON {idx, len, payload_base64};
+                  -raw / -jsonl for readable payloads, -store to read an archive
+  restore         append records from a JSON dump file or an archive into a target dir
+  archive         list what an archive (B2 / S3 / directory) holds
   compact         merge a contiguous range of closed segments into a single one
   mark-archived   touch the .archived sidecar so retention can delete the segment
 
@@ -352,6 +360,22 @@ func loadKeyFile(keyFile string) *axwal.EncryptionConfig {
 	return &axwal.EncryptionConfig{Key: b}
 }
 
+// loadKeys is loadKeyFile plus a comma-separated list of earlier keys that
+// are accepted for decryption.
+func loadKeys(keyFile, oldKeyFiles string) *axwal.EncryptionConfig {
+	enc := loadKeyFile(keyFile)
+	if oldKeyFiles == "" {
+		return enc
+	}
+	if enc == nil {
+		fatal("-old-key-files requires -key-file")
+	}
+	for _, p := range strings.Split(oldKeyFiles, ",") {
+		enc.OldKeys = append(enc.OldKeys, loadKeyFile(strings.TrimSpace(p)).Key)
+	}
+	return enc
+}
+
 // ---------------- tail ----------------
 
 func cmdTail(args []string) {
@@ -464,7 +488,7 @@ func cmdStats(args []string) {
 	)
 	for _, p := range matches {
 		base := filepath.Base(p)
-		if strings.HasSuffix(base, ".archived") || strings.HasSuffix(base, ".meta") {
+		if strings.HasSuffix(base, ".archived") || strings.HasSuffix(base, ".meta") || strings.HasSuffix(base, ".tmp") {
 			continue
 		}
 		fi, err := os.Stat(p)
@@ -558,15 +582,122 @@ func cmdStats(args []string) {
 
 // ---------------- dump ----------------
 
+// recordPrinter returns the output function for dump's format flags.
+//
+//	default  {"idx":1,"len":17,"payload":"<base64>"}   (round-trips via restore)
+//	-jsonl   {"idx":1,"payload":{...}}                 payload embedded as JSON
+//	                                                   (as a string if it isn't JSON)
+//	-raw     the payload bytes as is, one record per line
+func recordPrinter(raw, jsonl bool) func(idx uint64, payload []byte) {
+	out := bufio.NewWriter(os.Stdout)
+	enc := json.NewEncoder(out)
+	enc.SetEscapeHTML(false)
+	return func(idx uint64, payload []byte) {
+		var err error
+		switch {
+		case raw:
+			out.Write(payload)
+			err = out.WriteByte('\n')
+		case jsonl:
+			var p any = string(payload)
+			if json.Valid(payload) {
+				p = json.RawMessage(payload)
+			}
+			err = enc.Encode(map[string]any{"idx": idx, "payload": p})
+		default:
+			err = enc.Encode(map[string]any{
+				"idx":     idx,
+				"len":     len(payload),
+				"payload": payload, // base64 in JSON
+			})
+		}
+		if err == nil {
+			err = out.Flush()
+		}
+		if err != nil {
+			fatal("write: %v", err)
+		}
+	}
+}
+
+// parseWhen accepts RFC 3339 or a bare date (UTC midnight). Empty = zero time.
+func parseWhen(flagName, v string) time.Time {
+	if v == "" {
+		return time.Time{}
+	}
+	for _, layout := range []string{time.RFC3339, "2006-01-02T15:04:05", "2006-01-02"} {
+		if t, err := time.Parse(layout, v); err == nil {
+			return t
+		}
+	}
+	fatal("-%s: want RFC 3339 or YYYY-MM-DD, got %q", flagName, v)
+	return time.Time{}
+}
+
+// archiveFlags are the flags shared by subcommands that read from an archive.
+type archiveFlags struct {
+	store, since, until *string
+}
+
+func addArchiveFlags(fs *flag.FlagSet) archiveFlags {
+	return archiveFlags{
+		store: fs.String("store", "", "read from an ARCHIVE instead of a WAL directory: b2://bucket/prefix, s3://bucket/prefix?region=…&endpoint=…, file:///dir (credentials from the environment)"),
+		since: fs.String("since", "", "archive only: segments with records at or after this time (RFC 3339 or YYYY-MM-DD, UTC)"),
+		until: fs.String("until", "", "archive only: segments with records at or before this time"),
+	}
+}
+
+func (af archiveFlags) open(ctx context.Context, from, to uint64, enc *axwal.EncryptionConfig) *axwal.ArchiveReader {
+	store, prefix, err := storeurl.Open(*af.store)
+	if err != nil {
+		fatal("%v", err)
+	}
+	r, err := axwal.OpenArchiveReader(ctx, axwal.ArchiveReaderOptions{
+		Store: store, Prefix: prefix,
+		FromIndex: from, ToIndex: to,
+		FromTime: parseWhen("since", *af.since), ToTime: parseWhen("until", *af.until),
+		Encryption: enc,
+	})
+	if err != nil {
+		fatal("open archive: %v", err)
+	}
+	return r
+}
+
 func cmdDump(args []string) {
 	fs := flag.NewFlagSet("dump", flag.ExitOnError)
 	dir := fs.String("dir", "", "WAL directory")
 	from := fs.Uint64("from", 0, "first index to dump (inclusive). 0=earliest")
-	to := fs.Uint64("to", 0, "last index to dump (inclusive). 0=read until ctx-stop")
+	to := fs.Uint64("to", 0, "last index to dump (inclusive). 0=up to the last record present")
+	follow := fs.Bool("follow", false, "keep waiting for new records past the current end (until -to or Ctrl-C)")
+	raw := fs.Bool("raw", false, "print payloads as is, one per line (no JSON envelope, no base64)")
+	jsonl := fs.Bool("jsonl", false, "print {idx, payload} with the payload embedded as JSON instead of base64")
 	keyFile := fs.String("key-file", "", "32-byte AES key file (required for encrypted WALs)")
+	oldKeys := fs.String("old-key-files", "", "comma-separated key files of earlier keys (after a key rotation)")
+	af := addArchiveFlags(fs)
 	fs.Parse(args)
-	if *dir == "" {
-		fatal("dump: -dir required")
+	if (*dir == "") == (*af.store == "") {
+		fatal("dump: exactly one of -dir or -store required")
+	}
+	enc := loadKeys(*keyFile, *oldKeys)
+	emit := recordPrinter(*raw, *jsonl)
+
+	ctx, cancel := signalContext()
+	defer cancel()
+
+	if *af.store != "" {
+		r := af.open(ctx, *from, *to, enc)
+		defer r.Close()
+		for {
+			payload, idx, err := r.Next(ctx)
+			if err != nil {
+				if err != io.EOF && ctx.Err() == nil {
+					fatal("next: %v", err)
+				}
+				return
+			}
+			emit(idx, payload)
+		}
 	}
 
 	opts := axwal.ReaderOptions{
@@ -574,7 +705,7 @@ func cmdDump(args []string) {
 		Name:              fmt.Sprintf("axwal-cli-dump-%d", os.Getpid()),
 		HeartbeatInterval: time.Second,
 		PollInterval:      50 * time.Millisecond,
-		Encryption:        loadKeyFile(*keyFile),
+		Encryption:        enc,
 	}
 	if *from == 0 {
 		opts.StartFrom = axwal.StartEarliest
@@ -589,23 +720,32 @@ func cmdDump(args []string) {
 	}
 	defer r.Close()
 
-	ctx, cancel := signalContext()
-	defer cancel()
+	// Without -follow a dump is a snapshot: it ends at the last record that
+	// exists right now, even if -to asks for more.
+	end := *to
+	if !*follow {
+		head, err := r.HeadIndex()
+		if err != nil {
+			fatal("head index: %v", err)
+		}
+		if end == 0 || end > head {
+			end = head
+		}
+		if r.NextIndex() > end {
+			return
+		}
+	}
 
-	enc := json.NewEncoder(os.Stdout)
 	for {
 		payload, idx, err := r.Next(ctx)
 		if err != nil {
+			if ctx.Err() == nil {
+				fatal("next: %v", err)
+			}
 			return
 		}
-		if err := enc.Encode(map[string]any{
-			"idx":     idx,
-			"len":     len(payload),
-			"payload": payload, // base64 in JSON
-		}); err != nil {
-			fatal("encode: %v", err)
-		}
-		if *to != 0 && idx >= *to {
+		emit(idx, payload)
+		if end != 0 && idx >= end {
 			return
 		}
 	}
@@ -617,10 +757,15 @@ func cmdRestore(args []string) {
 	fs := flag.NewFlagSet("restore", flag.ExitOnError)
 	dir := fs.String("dir", "", "TARGET WAL directory (writer will append here)")
 	src := fs.String("src", "", "JSON dump file (one record per line, format: {idx, len, payload})")
+	from := fs.Uint64("from", 0, "archive only: first index to restore (inclusive)")
+	to := fs.Uint64("to", 0, "archive only: last index to restore (inclusive)")
+	srcKey := fs.String("src-key-file", "", "archive only: 32-byte AES key the archive was written with")
+	srcOldKeys := fs.String("src-old-key-files", "", "archive only: comma-separated key files of earlier keys")
 	keyFile := fs.String("key-file", "", "32-byte AES key for the TARGET (target writer encrypts records)")
+	af := addArchiveFlags(fs)
 	fs.Parse(args)
-	if *dir == "" || *src == "" {
-		fatal("restore: -dir and -src required")
+	if *dir == "" || (*src == "") == (*af.store == "") {
+		fatal("restore: -dir and exactly one of -src or -store required")
 	}
 
 	w, err := axwal.OpenWriter(axwal.WriterOptions{Dir: *dir, Encryption: loadKeyFile(*keyFile)})
@@ -628,6 +773,30 @@ func cmdRestore(args []string) {
 		fatal("open writer: %v", err)
 	}
 	defer w.Close()
+
+	count := 0
+	if *af.store != "" {
+		ctx, cancel := signalContext()
+		defer cancel()
+		r := af.open(ctx, *from, *to, loadKeys(*srcKey, *srcOldKeys))
+		defer r.Close()
+		for {
+			payloads, _, err := r.NextBatch(ctx, 256)
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				w.Close()
+				fatal("read archive after %d records: %v", count, err)
+			}
+			if _, err := w.AppendBatch(payloads); err != nil {
+				fatal("append: %v", err)
+			}
+			count += len(payloads)
+		}
+		fmt.Printf("restored %d records into %s (lastIndex=%d)\n", count, *dir, w.LastIndex())
+		return
+	}
 
 	f, err := os.Open(*src)
 	if err != nil {
@@ -640,7 +809,6 @@ func cmdRestore(args []string) {
 		Payload []byte `json:"payload"`
 	}
 	dec := json.NewDecoder(f)
-	count := 0
 	for dec.More() {
 		var e entry
 		if err := dec.Decode(&e); err != nil {
@@ -652,6 +820,65 @@ func cmdRestore(args []string) {
 		count++
 	}
 	fmt.Printf("restored %d records into %s (lastIndex=%d)\n", count, *dir, w.LastIndex())
+}
+
+// ---------------- archive ----------------
+
+// cmdArchive prints the catalog of an archive: what is in the bucket, which
+// index and time range each object covers, and which key it needs.
+func cmdArchive(args []string) {
+	fs := flag.NewFlagSet("archive", flag.ExitOnError)
+	storeURL := fs.String("store", "", "archive location: b2://bucket/prefix, s3://bucket/prefix, file:///dir")
+	asJSON := fs.Bool("json", false, "print the manifest as JSON")
+	fs.Parse(args)
+	if *storeURL == "" {
+		fatal("archive: -store required")
+	}
+	store, prefix, err := storeurl.Open(*storeURL)
+	if err != nil {
+		fatal("%v", err)
+	}
+	ctx, cancel := signalContext()
+	defer cancel()
+	m, err := axwal.LoadArchiveManifest(ctx, store, prefix)
+	if err != nil {
+		fatal("load manifest: %v", err)
+	}
+	if *asJSON {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		_ = enc.Encode(m)
+		return
+	}
+	if len(m.Segments) == 0 {
+		fmt.Println("(empty)")
+		return
+	}
+	ts := func(unix int64) string {
+		if unix == 0 {
+			return "-"
+		}
+		return time.Unix(unix, 0).UTC().Format("2006-01-02 15:04:05")
+	}
+	fmt.Printf("%12s %12s %9s %10s  %-19s  %-19s  %-16s  %s\n",
+		"first", "last", "records", "size", "first record (UTC)", "last record (UTC)", "key fp", "object")
+	var total int64
+	var prev uint64
+	for i, s := range m.Segments {
+		if i > 0 && s.FirstIndex != prev+1 {
+			fmt.Printf("%12s  GAP: %d..%d missing\n", "", prev+1, s.FirstIndex-1)
+		}
+		prev = s.LastIndex
+		fp := s.KeyFingerprint
+		if fp == "" {
+			fp = "-"
+		}
+		fmt.Printf("%12d %12d %9d %10s  %-19s  %-19s  %-16s  %s\n",
+			s.FirstIndex, s.LastIndex, s.NumRecords, humanBytes(s.SizeBytes),
+			ts(s.FirstRecordUnix), ts(s.LastRecordUnix), fp, s.Key)
+		total += s.SizeBytes
+	}
+	fmt.Printf("\n%d segment(s), %s\n", len(m.Segments), humanBytes(total))
 }
 
 // ---------------- compact ----------------
@@ -691,7 +918,7 @@ func cmdCompact(args []string) {
 	var contained []seg
 	for _, p := range matches {
 		base := filepath.Base(p)
-		if strings.HasSuffix(base, ".archived") || strings.HasSuffix(base, ".meta") {
+		if strings.HasSuffix(base, ".archived") || strings.HasSuffix(base, ".meta") || strings.HasSuffix(base, ".tmp") {
 			continue
 		}
 		f, l, closed, zst, ok := parseSeg(base)

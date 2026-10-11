@@ -26,6 +26,27 @@ var ErrBackpressure = errors.New("axwal: backpressure (pending bytes exceed MaxP
 // on disk and will be cleaned up on the next OpenWriter() recovery pass.
 var ErrCloseTimeout = errors.New("axwal: writer close timed out")
 
+// ErrDiskFull is returned by Append/AppendBatch when the WAL directory is over
+// Retention.MaxTotalBytes (or the filesystem is under Retention.MinFreeBytes),
+// the janitor found nothing it is allowed to delete, and
+// Retention.OnDiskFull is DiskFullReject.
+var ErrDiskFull = errors.New("axwal: disk limit reached and no segment can be deleted")
+
+// ErrQueueFull is returned by AppendAsync when the async queue is at capacity;
+// the record was dropped (and counted in WriterStats.Dropped).
+var ErrQueueFull = errors.New("axwal: async queue full, record dropped")
+
+// ErrAsyncDisabled is returned by AppendAsync when WriterOptions.AsyncQueueSize
+// is zero.
+var ErrAsyncDisabled = errors.New("axwal: AppendAsync requires WriterOptions.AsyncQueueSize > 0")
+
+// ErrWriterClosed is returned by operations on a closed Writer.
+var ErrWriterClosed = errors.New("axwal: writer closed")
+
+// closeFinalizeGrace bounds how long Close lets the rotation pipeline of the
+// last segment run (compression, .meta, OnRotate) when CloseTimeout is unset.
+const closeFinalizeGrace = 30 * time.Second
+
 // WriterOptions configures a Writer.
 type WriterOptions struct {
 	// Dir is the WAL directory. Created if missing.
@@ -43,6 +64,45 @@ type WriterOptions struct {
 	// MaxSegmentRecords: rotate when the active segment has accumulated this
 	// many records. Zero disables.
 	MaxSegmentRecords uint64
+
+	// RotateAligned, when > 0, rotates on wall-clock boundaries that are
+	// multiples of this duration: time.Hour = every hour at :00,
+	// 24*time.Hour = once a day at 00:00. A segment then only ever holds
+	// records appended inside one such window, so an archive laid out by day
+	// matches the content rather than the moment the file happened to close.
+	//
+	// Durations that divide 24h evenly are aligned to midnight in
+	// RotateLocation; anything else is aligned to the Unix epoch. Independent
+	// of MaxSegmentAge (which counts from segment open) — both may be set.
+	RotateAligned time.Duration
+
+	// RotateLocation is the time zone for RotateAligned. Defaults to UTC.
+	RotateLocation *time.Location
+
+	// RotateOnClose makes Close() treat the last segment like a rotation:
+	// it is compressed (if CompressOnRotate), gets its .meta sidecar and is
+	// handed to OnRotate / the archiver before Close returns — bounded by
+	// CloseTimeout, or 30s when CloseTimeout is zero. Without it Close only
+	// renames the segment to its closed form. Implied by Archive.
+	RotateOnClose bool
+
+	// Archive, if non-nil, enables the built-in archiver: every closed
+	// segment is uploaded to Archive.Store and marked .archived once the
+	// upload is verified. See ArchiveConfig. Implies WriteMetaSidecar,
+	// RotateOnClose and Retention.RequireArchivedMark.
+	Archive *ArchiveConfig
+
+	// AsyncQueueSize, when > 0, enables AppendAsync: a bounded in-memory
+	// queue of this many records drained by a background goroutine.
+	AsyncQueueSize int
+
+	// AsyncQueueBytes optionally also bounds the async queue by total payload
+	// bytes. 0 = no byte limit.
+	AsyncQueueBytes int64
+
+	// AsyncBatchSize is the maximum number of queued records written per
+	// AppendBatch by the async drainer. Defaults to 256.
+	AsyncBatchSize int
 
 	// PreallocateSegments, when true, reserves MaxSegmentSize bytes on disk at
 	// segment-create time (Linux fallocate KEEP_SIZE, macOS F_PREALLOCATE).
@@ -113,6 +173,9 @@ type WriterOptions struct {
 
 	// Retention controls cursor-aware automatic deletion of old segments.
 	Retention RetentionConfig
+
+	// nowFn overrides the clock in tests.
+	nowFn func() time.Time
 }
 
 // SegmentInfo describes a closed segment delivered to the OnRotate callback
@@ -227,7 +290,47 @@ type RetentionConfig struct {
 	// RequireArchivedMark still applies — even time-aged segments wait for the
 	// sidecar before deletion.
 	MaxRetainAge time.Duration
+
+	// MinRetainAge, when > 0, keeps every closed segment on local disk for at
+	// least this long (by file ModTime), even when no reader needs it. The
+	// full rule: a segment is deleted when it is archived (if an archive mark
+	// is required) AND older than MinRetainAge AND not needed by live readers
+	// or MinRetainRecords. MaxRetainAge stays the hard ceiling. Disk-pressure
+	// eviction (MaxTotalBytes / MinFreeBytes) overrides MinRetainAge.
+	MinRetainAge time.Duration
+
+	// MaxTotalBytes, when > 0, caps the total size of segment files in the
+	// WAL directory. When exceeded the janitor deletes the oldest closed
+	// segments first — ignoring MinRetainAge and MinRetainRecords, but never
+	// a segment that is not archived yet (when an archive mark is required)
+	// or that a live reader still needs. The limit is enforced per janitor
+	// pass and on every rotation, so leave headroom of about one segment.
+	MaxTotalBytes int64
+
+	// MinFreeBytes, when > 0, triggers the same eviction when the filesystem
+	// holding the WAL has less free space than this (Unix only).
+	MinFreeBytes int64
+
+	// OnDiskFull selects what Append does while the directory is over the
+	// limit and nothing can be deleted (archive unreachable, disk full).
+	OnDiskFull DiskFullPolicy
 }
+
+// DiskFullPolicy is the writer's behavior while a disk limit is exceeded and
+// the janitor has nothing it may delete.
+type DiskFullPolicy int
+
+const (
+	// DiskFullReject (default): Append returns ErrDiskFull; counted in
+	// WriterStats.DiskFullRejects.
+	DiskFullReject DiskFullPolicy = iota
+	// DiskFullDrop: Append discards the records and returns (nil indices,
+	// nil error); counted in WriterStats.Dropped. For telemetry-style logs
+	// where losing records beats failing the caller.
+	DiskFullDrop
+	// DiskFullIgnore: keep writing past the limit (eviction still runs).
+	DiskFullIgnore
+)
 
 // WriterStats is a thread-safe snapshot of writer counters/gauges. Cheap to
 // call in a metrics-scrape loop (no I/O, brief mutex acquisition).
@@ -248,6 +351,31 @@ type WriterStats struct {
 	FsyncErrors         uint64
 	BackpressureRejects uint64
 	RetentionDeletes    uint64
+
+	// Dropped counts records that were discarded instead of written: async
+	// queue overflow, async write failures and DiskFullDrop.
+	Dropped uint64
+	// AsyncErrors counts failed background writes of AppendAsync batches.
+	AsyncErrors uint64
+	// AsyncQueued is the number of records currently waiting in the async queue.
+	AsyncQueued int
+	// DiskFullRejects counts Append calls refused with ErrDiskFull.
+	DiskFullRejects uint64
+	// DiskFull reports whether a disk limit is currently exceeded with
+	// nothing left to delete.
+	DiskFull bool
+
+	// Archive gauges/counters (zero unless WriterOptions.Archive is set).
+	//
+	// ArchivePending / ArchivePendingBytes: closed segments not yet uploaded.
+	// ArchiveOldestPendingAge: age of the oldest of them (0 if none).
+	// ArchiveLastSuccess: time of the last verified upload (zero if none yet).
+	ArchivePending          int
+	ArchivePendingBytes     int64
+	ArchiveOldestPendingAge time.Duration
+	ArchiveLastSuccess      time.Time
+	ArchiveUploads          uint64
+	ArchiveErrors           uint64
 }
 
 type writerCounters struct {
@@ -259,6 +387,9 @@ type writerCounters struct {
 	fsyncErrors       atomic.Uint64
 	backpressure      atomic.Uint64
 	retentionDeletes  atomic.Uint64
+	dropped           atomic.Uint64
+	asyncErrors       atomic.Uint64
+	diskFullRejects   atomic.Uint64
 }
 
 // Writer is the single-process append side of the WAL.
@@ -287,6 +418,30 @@ type Writer struct {
 	openedAt   time.Time
 	curRecords uint64
 	closed     bool
+	// segFirstAt / segLastAt: append time of the first / last record of the
+	// active segment. Valid iff curRecords > 0.
+	segFirstAt time.Time
+	segLastAt  time.Time
+
+	// finalizing is the set of closed segments still inside the rotation
+	// pipeline (rename → compress → meta → OnRotate).
+	finMu      sync.Mutex
+	finalizing map[segRange]struct{}
+
+	arch *archiver // non-nil iff opts.Archive is set
+
+	// diskFull is set by the janitor while a disk limit is exceeded and
+	// nothing can be deleted.
+	diskFull    atomic.Bool
+	janitorKick chan struct{}
+
+	// Async append state. Used iff opts.AsyncQueueSize > 0.
+	asyncMu     sync.RWMutex // guards asyncClosed vs. sends on asyncCh
+	asyncCh     chan []byte
+	asyncClosed bool
+	asyncBytes  atomic.Int64
+	asyncWG     sync.WaitGroup
+	asyncOnce   sync.Once
 
 	// rotateWG tracks async post-rotation work (rename + compress).
 	rotateWG sync.WaitGroup
@@ -332,6 +487,31 @@ func OpenWriter(opts WriterOptions) (*Writer, error) {
 		if opts.GroupCommit.MaxBatchBytes <= 0 {
 			opts.GroupCommit.MaxBatchBytes = 1 << 20
 		}
+	}
+
+	if opts.RotateAligned < 0 {
+		return nil, errors.New("axwal: WriterOptions.RotateAligned must be >= 0")
+	}
+	if opts.RotateLocation == nil {
+		opts.RotateLocation = time.UTC
+	}
+	if opts.nowFn == nil {
+		opts.nowFn = time.Now
+	}
+	if opts.AsyncQueueSize > 0 && opts.AsyncBatchSize <= 0 {
+		opts.AsyncBatchSize = 256
+	}
+	if opts.Archive != nil {
+		cfg, err := opts.Archive.withDefaults()
+		if err != nil {
+			return nil, err
+		}
+		opts.Archive = &cfg
+		// The archiver needs the sidecar for record times / key fingerprint,
+		// a properly finished last segment, and retention must wait for it.
+		opts.WriteMetaSidecar = true
+		opts.RotateOnClose = true
+		opts.Retention.RequireArchivedMark = true
 	}
 
 	if opts.Logger == nil {
@@ -390,8 +570,24 @@ func OpenWriter(opts WriterOptions) (*Writer, error) {
 
 	if opts.Retention.Enabled {
 		w.janitorStop = make(chan struct{})
+		w.janitorKick = make(chan struct{}, 1)
+		if opts.Retention.MaxTotalBytes > 0 || opts.Retention.MinFreeBytes > 0 {
+			// Know right away whether we start over the limit.
+			w.kickJanitor()
+		}
 		w.janitorWG.Add(1)
 		go w.janitorLoop()
+	}
+
+	if opts.Archive != nil {
+		w.arch = newArchiver(w, *opts.Archive)
+		w.arch.start()
+	}
+
+	if opts.AsyncQueueSize > 0 {
+		w.asyncCh = make(chan []byte, opts.AsyncQueueSize)
+		w.asyncWG.Add(1)
+		go w.asyncLoop()
 	}
 
 	if opts.GroupCommit.Enabled {
@@ -402,7 +598,7 @@ func OpenWriter(opts WriterOptions) (*Writer, error) {
 		go w.commitLoop()
 	}
 
-	if opts.MaxSegmentAge > 0 {
+	if opts.MaxSegmentAge > 0 || opts.RotateAligned > 0 {
 		w.rotateAgeStop = make(chan struct{})
 		w.rotateAgeWG.Add(1)
 		go w.rotateAgeLoop()
@@ -438,6 +634,14 @@ func (w *Writer) Stats() WriterStats {
 	s.FsyncErrors = w.cnt.fsyncErrors.Load()
 	s.BackpressureRejects = w.cnt.backpressure.Load()
 	s.RetentionDeletes = w.cnt.retentionDeletes.Load()
+	s.Dropped = w.cnt.dropped.Load()
+	s.AsyncErrors = w.cnt.asyncErrors.Load()
+	s.AsyncQueued = len(w.asyncCh)
+	s.DiskFullRejects = w.cnt.diskFullRejects.Load()
+	s.DiskFull = w.diskFull.Load()
+	if w.arch != nil {
+		w.arch.fillStats(&s)
+	}
 	return s
 }
 
@@ -461,6 +665,9 @@ func (w *Writer) AppendContext(ctx context.Context, payload []byte) (uint64, err
 	idxs, err := w.AppendBatchContext(ctx, [][]byte{payload})
 	if err != nil {
 		return 0, err
+	}
+	if len(idxs) == 0 {
+		return 0, nil // dropped by DiskFullDrop
 	}
 	return idxs[0], nil
 }
@@ -489,7 +696,18 @@ func (w *Writer) AppendBatchContext(ctx context.Context, records [][]byte) ([]ui
 	defer w.mu.Unlock()
 
 	if w.closed {
-		return nil, errors.New("axwal: writer closed")
+		return nil, ErrWriterClosed
+	}
+
+	if w.diskFull.Load() {
+		switch w.opts.Retention.OnDiskFull {
+		case DiskFullDrop:
+			w.cnt.dropped.Add(uint64(len(records)))
+			return nil, nil
+		case DiskFullReject:
+			w.cnt.diskFullRejects.Add(1)
+			return nil, ErrDiskFull
+		}
 	}
 
 	// If encryption is enabled, seal every payload now. We materialize a new
@@ -527,11 +745,16 @@ func (w *Writer) AppendBatchContext(ctx context.Context, records [][]byte) ([]ui
 			ErrBackpressure, w.pendingBytes, totalSize, w.opts.MaxPendingBytes)
 	}
 
-	if w.shouldRotateBeforeWriteLocked(totalSize, uint64(len(records))) {
+	now := w.opts.nowFn()
+	if w.shouldRotateBeforeWriteLocked(totalSize, uint64(len(records))) || w.crossedBoundaryLocked(now) {
 		if err := w.rotateLocked(); err != nil {
 			return nil, fmt.Errorf("rotate: %w", err)
 		}
 	}
+	if w.curRecords == 0 {
+		w.segFirstAt = now
+	}
+	w.segLastAt = now
 
 	idxs := make([]uint64, len(records))
 	for i, r := range records {
@@ -683,9 +906,66 @@ func (w *Writer) Rotate() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.closed {
-		return errors.New("axwal: writer closed")
+		return ErrWriterClosed
 	}
 	return w.rotateLocked()
+}
+
+// RotateKey switches the writer to a new 32-byte encryption key without
+// stopping it. The active segment is rotated first, so every segment is
+// sealed with exactly one key: records appended before the call use the old
+// key, records after it the new one. Readers need the new key as
+// EncryptionConfig.Key and the previous ones in OldKeys.
+//
+// Returns an error if the writer was opened without Encryption.
+func (w *Writer) RotateKey(newKey []byte) error {
+	c, err := newCipher(newKey)
+	if err != nil {
+		return err
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed {
+		return ErrWriterClosed
+	}
+	if w.cipher == nil {
+		return fmt.Errorf("%w: RotateKey on a writer opened without Encryption", ErrEncryption)
+	}
+	if err := w.rotateLocked(); err != nil {
+		return fmt.Errorf("rotate: %w", err)
+	}
+	w.cipher = c
+	return nil
+}
+
+// keyFingerprintLocked returns the fingerprint of the key sealing the active
+// segment ("" when encryption is off). Caller holds w.mu.
+func (w *Writer) keyFingerprintLocked() string {
+	if w.cipher == nil {
+		return ""
+	}
+	return w.cipher.fp
+}
+
+// crossedBoundaryLocked reports whether `now` falls into a later RotateAligned
+// window than the first record of the active segment. Caller holds w.mu.
+func (w *Writer) crossedBoundaryLocked(now time.Time) bool {
+	if w.opts.RotateAligned <= 0 || w.curRecords == 0 {
+		return false
+	}
+	d, loc := w.opts.RotateAligned, w.opts.RotateLocation
+	return alignedWindowStart(now, d, loc).After(alignedWindowStart(w.segFirstAt, d, loc))
+}
+
+// alignedWindowStart returns the start of the RotateAligned window containing t.
+func alignedWindowStart(t time.Time, d time.Duration, loc *time.Location) time.Time {
+	const day = 24 * time.Hour
+	if d > day || day%d != 0 {
+		return t.Truncate(d) // aligned to the Unix epoch
+	}
+	t = t.In(loc)
+	midnight := time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, loc)
+	return midnight.Add(t.Sub(midnight).Truncate(d))
 }
 
 func (w *Writer) rotateLocked() error {
@@ -717,8 +997,13 @@ func (w *Writer) rotateLocked() error {
 	}
 
 	rotatedPath := w.curPath
-	rotatedFirst := w.firstIndex
-	rotatedLast := w.lastIndex
+	rs := rotatedSeg{
+		first:   w.firstIndex,
+		last:    w.lastIndex,
+		firstAt: w.segFirstAt,
+		lastAt:  w.segLastAt,
+		keyFP:   w.keyFingerprintLocked(),
+	}
 
 	if err := w.file.Close(); err != nil {
 		return err
@@ -726,8 +1011,9 @@ func (w *Writer) rotateLocked() error {
 	w.file = nil
 	w.buf = nil
 
+	w.markFinalizing(rs)
 	w.rotateWG.Add(1)
-	go w.finalizeRotated(rotatedPath, rotatedFirst, rotatedLast)
+	go w.finalizeRotated(rotatedPath, rs)
 
 	return w.openNewSegment()
 }
@@ -758,7 +1044,7 @@ func (w *Writer) openNewSegment() error {
 	w.firstIndex = first
 	w.curSize = 0
 	w.curRecords = 0
-	w.openedAt = time.Now()
+	w.openedAt = w.opts.nowFn()
 	w.buf = bufio.NewWriterSize(f, w.opts.BufferSize)
 	return nil
 }
@@ -766,7 +1052,15 @@ func (w *Writer) openNewSegment() error {
 // Close finalizes the current segment (rename to wal-F-L), waits for any
 // in-flight rotations, stops the janitor and group-commit goroutines, and
 // releases the lock.
+//
+// Records still sitting in the AppendAsync queue are written first. With
+// RotateOnClose the last segment also goes through the full rotation pipeline,
+// and with Archive.DrainOnClose the archiver gets that long to upload what is
+// still pending. CloseTimeout caps the whole sequence.
 func (w *Writer) Close() error {
+	// Queued async records still need a live writer to land in.
+	w.stopAsync()
+
 	w.mu.Lock()
 	if w.closed {
 		w.mu.Unlock()
@@ -774,7 +1068,11 @@ func (w *Writer) Close() error {
 	}
 	w.closed = true
 
-	var firstErr error
+	var (
+		firstErr error
+		tail     *rotatedSeg
+		tailPath string
+	)
 	if w.file != nil {
 		if err := w.buf.Flush(); err != nil && firstErr == nil {
 			firstErr = err
@@ -794,8 +1092,19 @@ func (w *Writer) Close() error {
 		// otherwise remove the empty placeholder.
 		if w.lastIndex >= w.firstIndex {
 			final := filepath.Join(w.dir, formatClosedName(w.firstIndex, w.lastIndex))
-			if err := os.Rename(w.curPath, final); err != nil && firstErr == nil {
-				firstErr = fmt.Errorf("rename on close: %w", err)
+			if err := os.Rename(w.curPath, final); err != nil {
+				if firstErr == nil {
+					firstErr = fmt.Errorf("rename on close: %w", err)
+				}
+			} else if w.opts.RotateOnClose {
+				tail = &rotatedSeg{
+					first:   w.firstIndex,
+					last:    w.lastIndex,
+					firstAt: w.segFirstAt,
+					lastAt:  w.segLastAt,
+					keyFP:   w.keyFingerprintLocked(),
+				}
+				tailPath = final
 			}
 		} else {
 			if err := os.Remove(w.curPath); err != nil && !os.IsNotExist(err) && firstErr == nil {
@@ -828,18 +1137,53 @@ func (w *Writer) Close() error {
 		w.rotateAgeWG.Wait()
 	}
 
+	// left returns how long a shutdown phase may still take: `limit` capped by
+	// what remains of CloseTimeout. 0 means unbounded.
+	start := time.Now()
+	left := func(limit time.Duration) time.Duration {
+		if w.opts.CloseTimeout <= 0 {
+			return limit
+		}
+		rem := w.opts.CloseTimeout - time.Since(start)
+		if rem < 50*time.Millisecond {
+			rem = 50 * time.Millisecond
+		}
+		if limit <= 0 || rem < limit {
+			return rem
+		}
+		return limit
+	}
+
+	if tail != nil {
+		w.markFinalizing(*tail)
+		w.rotateWG.Add(1)
+		go func() {
+			defer w.rotateWG.Done()
+			w.finishClosed(tailPath, *tail)
+		}()
+	}
+	if tail != nil || w.arch != nil {
+		// Let the pipeline actually finish its segments (canceling ctx below
+		// would make it bail out before compression / .meta / OnRotate).
+		waitTimeout(&w.rotateWG, left(closeFinalizeGrace))
+	}
+	if w.arch != nil {
+		if d := w.arch.cfg.DrainOnClose; d > 0 {
+			w.arch.drain(left(d))
+		}
+	}
+
 	// Cancel the writer ctx so any retry loops in finalizeRotated /
 	// robustCompressZstd give up. Without this they'd loop forever on a stuck
 	// disk and rotateWG.Wait() would hang.
 	w.ctxCancel()
+	if w.arch != nil {
+		w.arch.stop()
+	}
 
 	timedOut := false
 	if w.opts.CloseTimeout > 0 {
-		done := make(chan struct{})
-		go func() { w.rotateWG.Wait(); close(done) }()
-		select {
-		case <-done:
-		case <-time.After(w.opts.CloseTimeout):
+		if !waitTimeout(&w.rotateWG, left(0)) {
 			timedOut = true
 			w.log.Warn("close timeout: abandoning in-flight rotations",
 				"timeout", w.opts.CloseTimeout)
@@ -857,6 +1201,35 @@ func (w *Writer) Close() error {
 	return firstErr
 }
 
+// waitTimeout waits for wg for at most d (d <= 0: no limit). Reports whether
+// wg finished.
+func waitTimeout(wg *sync.WaitGroup, d time.Duration) bool {
+	if d <= 0 {
+		wg.Wait()
+		return true
+	}
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-done:
+		return true
+	case <-t.C:
+		return false
+	}
+}
+
+func (w *Writer) kickJanitor() {
+	if w.janitorKick == nil {
+		return
+	}
+	select {
+	case w.janitorKick <- struct{}{}:
+	default:
+	}
+}
+
 // TruncatePrefix synchronously deletes all closed segments whose LastIndex is
 // strictly below uptoIndex, plus their .archived/.meta sidecars. The active
 // open segment is never touched.
@@ -872,7 +1245,7 @@ func (w *Writer) TruncatePrefix(uptoIndex uint64) (int, error) {
 	w.mu.Lock()
 	if w.closed {
 		w.mu.Unlock()
-		return 0, errors.New("axwal: writer closed")
+		return 0, ErrWriterClosed
 	}
 	curPath := w.curPath
 	w.mu.Unlock()

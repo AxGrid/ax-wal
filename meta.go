@@ -20,13 +20,23 @@ const metaSidecarSuffix = ".meta"
 // by axwal-cli for verification and by external archivers that want a quick
 // summary without parsing the segment file.
 type SegmentMeta struct {
-	FirstIndex          uint64 `json:"first_index"`
-	LastIndex           uint64 `json:"last_index"`
-	NumRecords          uint64 `json:"num_records"`
+	FirstIndex           uint64 `json:"first_index"`
+	LastIndex            uint64 `json:"last_index"`
+	NumRecords           uint64 `json:"num_records"`
 	NumBytesUncompressed int64  `json:"num_bytes_uncompressed"`
-	SHA256Uncompressed  string `json:"sha256_uncompressed"`
-	CreatedAtUnix       int64  `json:"created_at_unix"` // mtime when written
-	Compression         string `json:"compression"`     // "" or "zst"
+	SHA256Uncompressed   string `json:"sha256_uncompressed"`
+	CreatedAtUnix        int64  `json:"created_at_unix"` // when the sidecar was written
+	Compression          string `json:"compression"`     // "" or "zst"
+
+	// FirstRecordUnix / LastRecordUnix are the wall-clock times (seconds) at
+	// which the first and last record of the segment were appended. Zero when
+	// unknown (segment finalized by crash recovery).
+	FirstRecordUnix int64 `json:"first_record_unix,omitempty"`
+	LastRecordUnix  int64 `json:"last_record_unix,omitempty"`
+
+	// KeyFingerprint identifies the encryption key the segment was sealed
+	// with (see KeyFingerprint). Empty for unencrypted segments.
+	KeyFingerprint string `json:"key_fingerprint,omitempty"`
 }
 
 // metaSidecarFor returns the path of the .meta sidecar for the given segment
@@ -37,34 +47,38 @@ func metaSidecarFor(dir string, first, last uint64) string {
 	return filepath.Join(dir, formatClosedName(first, last)+metaSidecarSuffix)
 }
 
-// writeMetaSidecar computes the meta for a freshly-rotated, still-uncompressed
-// segment at `uncompressedPath` and writes the sidecar atomically.
-func writeMetaSidecar(dir, uncompressedPath string, first, last uint64) error {
+// computeSegmentMeta hashes a closed, still-uncompressed segment. It must run
+// BEFORE compression: the compressor removes the uncompressed file.
+func computeSegmentMeta(uncompressedPath string, first, last uint64) (SegmentMeta, error) {
 	f, err := os.Open(uncompressedPath)
 	if err != nil {
-		return fmt.Errorf("open %s for meta: %w", uncompressedPath, err)
+		return SegmentMeta{}, fmt.Errorf("open %s for meta: %w", uncompressedPath, err)
 	}
 	defer f.Close()
 
 	h := sha256.New()
 	n, err := io.Copy(h, f)
 	if err != nil {
-		return fmt.Errorf("hash %s: %w", uncompressedPath, err)
+		return SegmentMeta{}, fmt.Errorf("hash %s: %w", uncompressedPath, err)
 	}
-	meta := SegmentMeta{
+	return SegmentMeta{
 		FirstIndex:           first,
 		LastIndex:            last,
 		NumRecords:           last - first + 1,
 		NumBytesUncompressed: n,
 		SHA256Uncompressed:   hex.EncodeToString(h.Sum(nil)),
-		CreatedAtUnix:        time.Now().Unix(),
-	}
+	}, nil
+}
+
+// writeMetaSidecar writes the sidecar for meta atomically.
+func writeMetaSidecar(dir string, meta SegmentMeta) error {
+	meta.CreatedAtUnix = time.Now().Unix()
 	body, err := json.MarshalIndent(meta, "", "  ")
 	if err != nil {
 		return err
 	}
 
-	path := metaSidecarFor(dir, first, last)
+	path := metaSidecarFor(dir, meta.FirstIndex, meta.LastIndex)
 	tmp := path + ".tmp"
 	if err := os.WriteFile(tmp, body, 0644); err != nil {
 		return err

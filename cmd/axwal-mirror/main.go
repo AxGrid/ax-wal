@@ -16,6 +16,11 @@
 //	  -addr 127.0.0.1:9001 \
 //	  -dst /local/follower \
 //	  -name follower-1
+//
+// Archive source (no access to the primary at all — follows the bucket the
+// primary's archiver uploads to):
+//
+//	B2_KEY_ID=… B2_APP_KEY=… axwal-mirror -store b2://bucket/wal/kiosk-prod -dst /local/copy
 package main
 
 import (
@@ -30,6 +35,7 @@ import (
 	"time"
 
 	axwal "github.com/axgrid/ax-wal"
+	"github.com/axgrid/ax-wal/store/storeurl"
 )
 
 func main() {
@@ -47,7 +53,11 @@ func main() {
 	sshAgent := flag.Bool("ssh-agent", false, "use SSH_AUTH_SOCK as an additional auth method")
 	sshKnownHosts := flag.String("ssh-known-hosts", "", "path to OpenSSH known_hosts (empty = INSECURE: skip host-key verification)")
 
-	srcKey := flag.String("src-key-file", "", "32B AES key for local encrypted source")
+	// Archive source flags.
+	storeURL := flag.String("store", "", "ARCHIVE source: b2://bucket/prefix, s3://bucket/prefix?region=…&endpoint=…, file:///dir (credentials from the environment)")
+	poll := flag.Duration("poll", 30*time.Second, "ARCHIVE: how often to look for newly uploaded segments")
+
+	srcKey := flag.String("src-key-file", "", "32B AES key for an encrypted local or archive source")
 	dstKey := flag.String("dst-key-file", "", "32B AES key for encrypted destination")
 	statusEvery := flag.Duration("status", 5*time.Second, "status log interval; 0 disables")
 	flag.Parse()
@@ -57,13 +67,19 @@ func main() {
 		flag.Usage()
 		os.Exit(2)
 	}
-	if *src == "" && *addr == "" {
-		fmt.Fprintln(os.Stderr, "axwal-mirror: provide either -src (local) or -addr (remote)")
+	nsrc := 0
+	for _, v := range []string{*src, *addr, *storeURL} {
+		if v != "" {
+			nsrc++
+		}
+	}
+	if nsrc == 0 {
+		fmt.Fprintln(os.Stderr, "axwal-mirror: provide one of -src (local), -addr (remote) or -store (archive)")
 		flag.Usage()
 		os.Exit(2)
 	}
-	if *src != "" && *addr != "" {
-		log.Fatalf("axwal-mirror: -src and -addr are mutually exclusive")
+	if nsrc > 1 {
+		log.Fatalf("axwal-mirror: -src, -addr and -store are mutually exclusive")
 	}
 
 	opts := axwal.MirrorOptions{
@@ -93,7 +109,19 @@ func main() {
 		opts.DstWriterOptions.Encryption = k
 	}
 
-	if *src != "" {
+	if *storeURL != "" {
+		store, prefix, err := storeurl.Open(*storeURL)
+		if err != nil {
+			log.Fatalf("axwal-mirror: %v", err)
+		}
+		opts.SrcArchive = &axwal.ArchiveReaderOptions{
+			Store:        store,
+			Prefix:       prefix,
+			FromIndex:    opts.StartAtIndex, // -from <index>; resumes from <dst>/archive-mirror.pos afterwards
+			PollInterval: *poll,
+			Encryption:   loadKeyFile(*srcKey),
+		}
+	} else if *src != "" {
 		opts.SrcDir = *src
 		if *name == "" {
 			log.Fatalf("axwal-mirror: -name is required for local source")
@@ -129,7 +157,9 @@ func main() {
 	}
 
 	source := *src
-	if source == "" {
+	if *storeURL != "" {
+		source = *storeURL
+	} else if source == "" {
 		source = *addr
 		if *tunnel != "" {
 			source = *tunnel + " → " + *addr

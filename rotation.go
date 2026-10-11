@@ -17,19 +17,36 @@ import (
 const (
 	renameRetryInterval      = 500 * time.Millisecond
 	compressionRetryInterval = 500 * time.Millisecond
+
+	// compressTmpSuffix marks an in-progress compression output. Leftovers
+	// from a crash are removed by recovery.
+	compressTmpSuffix = ".tmp"
 )
 
+// rotatedSeg carries what the writer knew about a segment at the moment it
+// stopped appending to it.
+type rotatedSeg struct {
+	first, last uint64
+	// firstAt / lastAt are the append times of the first and last record.
+	firstAt, lastAt time.Time
+	// keyFP is the fingerprint of the encryption key in effect ("" = none).
+	keyFP string
+}
+
+type segRange struct{ first, last uint64 }
+
 // finalizeRotated runs in its own goroutine after rotation. It renames the
-// open segment to wal-F-L and (optionally) compresses it to .zst, retrying on
-// transient I/O errors. The writer's ctx provides cancellation: when Close()
-// fires, in-flight retries give up cleanly and the segment is left in
-// whatever intermediate state it reached (recovery on next OpenWriter handles
-// that — see recover_).
-func (w *Writer) finalizeRotated(openPath string, first, last uint64) {
+// open segment to wal-F-L and hands it to finishClosed, retrying on transient
+// I/O errors. The writer's ctx provides cancellation: when Close() fires,
+// in-flight retries give up cleanly and the segment is left in whatever
+// intermediate state it reached (recovery on next OpenWriter handles that —
+// see recover_).
+func (w *Writer) finalizeRotated(openPath string, rs rotatedSeg) {
 	defer w.rotateWG.Done()
 
-	finalPath := filepath.Join(w.dir, formatClosedName(first, last))
+	finalPath := filepath.Join(w.dir, formatClosedName(rs.first, rs.last))
 	if err := robustRename(w.ctx, w.log, openPath, finalPath); err != nil {
+		w.doneFinalizing(rs)
 		if errors.Is(err, context.Canceled) {
 			w.log.Warn("rotation rename abandoned (writer closing)",
 				"old", filepath.Base(openPath), "new", filepath.Base(finalPath))
@@ -38,6 +55,31 @@ func (w *Writer) finalizeRotated(openPath string, first, last uint64) {
 		w.log.Error("rotation rename failed", "old", filepath.Base(openPath),
 			"new", filepath.Base(finalPath), "err", err)
 		return
+	}
+	w.finishClosed(finalPath, rs)
+}
+
+// finishClosed runs the post-rename pipeline for a closed, uncompressed
+// segment: hash for .meta, compress, write .meta, call OnRotate, then release
+// the segment to the archiver and the janitor.
+func (w *Writer) finishClosed(finalPath string, rs rotatedSeg) {
+	defer w.doneFinalizing(rs)
+
+	// The meta hash covers the UNCOMPRESSED bytes, so it has to be taken
+	// before compression removes that file.
+	var meta *SegmentMeta
+	if w.opts.WriteMetaSidecar {
+		m, err := computeSegmentMeta(finalPath, rs.first, rs.last)
+		if err != nil {
+			w.log.Error("meta sidecar: hashing failed", "name", filepath.Base(finalPath), "err", err)
+		} else {
+			if !rs.firstAt.IsZero() {
+				m.FirstRecordUnix = rs.firstAt.Unix()
+				m.LastRecordUnix = rs.lastAt.Unix()
+			}
+			m.KeyFingerprint = rs.keyFP
+			meta = &m
+		}
 	}
 
 	finalLivePath := finalPath
@@ -61,8 +103,11 @@ func (w *Writer) finalizeRotated(openPath string, first, last uint64) {
 
 	// Optional .meta sidecar — written before the user callback so the callback
 	// can read it (e.g., to upload metadata alongside the segment).
-	if w.opts.WriteMetaSidecar {
-		if err := writeMetaSidecar(w.dir, finalPath, first, last); err != nil {
+	if meta != nil {
+		if compressedFlag {
+			meta.Compression = "zst"
+		}
+		if err := writeMetaSidecar(w.dir, *meta); err != nil {
 			w.log.Error("meta sidecar write failed", "name", filepath.Base(finalPath), "err", err)
 		}
 	}
@@ -75,8 +120,8 @@ func (w *Writer) finalizeRotated(openPath string, first, last uint64) {
 		}
 		info := SegmentInfo{
 			Path:       finalLivePath,
-			FirstIndex: first,
-			LastIndex:  last,
+			FirstIndex: rs.first,
+			LastIndex:  rs.last,
 			SizeBytes:  size,
 			Compressed: compressedFlag,
 		}
@@ -93,6 +138,34 @@ func (w *Writer) finalizeRotated(openPath string, first, last uint64) {
 			w.opts.OnRotate(info)
 		}()
 	}
+}
+
+// markFinalizing records that a segment is still going through the rotation
+// pipeline, so the archiver doesn't pick up a half-compressed file.
+func (w *Writer) markFinalizing(rs rotatedSeg) {
+	w.finMu.Lock()
+	if w.finalizing == nil {
+		w.finalizing = map[segRange]struct{}{}
+	}
+	w.finalizing[segRange{rs.first, rs.last}] = struct{}{}
+	w.finMu.Unlock()
+}
+
+func (w *Writer) doneFinalizing(rs rotatedSeg) {
+	w.finMu.Lock()
+	delete(w.finalizing, segRange{rs.first, rs.last})
+	w.finMu.Unlock()
+	if w.arch != nil {
+		w.arch.wake()
+	}
+	w.kickJanitor()
+}
+
+func (w *Writer) isFinalizing(first, last uint64) bool {
+	w.finMu.Lock()
+	defer w.finMu.Unlock()
+	_, ok := w.finalizing[segRange{first, last}]
+	return ok
 }
 
 // sleepCtx waits for d or until ctx is done. Returns the ctx error on cancel.
@@ -157,10 +230,14 @@ func compressOnceZstd(src, dst string) error {
 	}
 	defer in.Close()
 
-	out, err := os.Create(dst)
+	// Compress into a temp name and rename: wal-F-L.zst must never be visible
+	// half-written, or a reader / the archiver could pick up a truncated file.
+	tmp := dst + compressTmpSuffix
+	out, err := os.Create(tmp)
 	if err != nil {
 		return err
 	}
+	defer os.Remove(tmp) // no-op after a successful rename
 
 	enc, err := zstd.NewWriter(out,
 		zstd.WithEncoderLevel(zstd.SpeedDefault),
@@ -185,6 +262,9 @@ func compressOnceZstd(src, dst string) error {
 		return err
 	}
 	if err := out.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, dst); err != nil {
 		return err
 	}
 	// Make sure the compressed name is durable in the directory.
