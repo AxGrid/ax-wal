@@ -2,7 +2,9 @@ package axwal
 
 import (
 	"context"
+	"crypto/ecdsa"
 	"crypto/ed25519"
+	"crypto/elliptic"
 	"crypto/rand"
 	"encoding/pem"
 	"errors"
@@ -348,7 +350,7 @@ type testSSHServer struct {
 	conns []net.Conn
 }
 
-func startSSHServer(t *testing.T, addr string, hostKey ssh.Signer, allowed ssh.PublicKey) *testSSHServer {
+func startSSHServer(t *testing.T, addr string, hostKey ssh.Signer, allowed ssh.PublicKey, moreHostKeys ...ssh.Signer) *testSSHServer {
 	t.Helper()
 	cfg := &ssh.ServerConfig{
 		PublicKeyCallback: func(_ ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
@@ -359,6 +361,9 @@ func startSSHServer(t *testing.T, addr string, hostKey ssh.Signer, allowed ssh.P
 		},
 	}
 	cfg.AddHostKey(hostKey)
+	for _, k := range moreHostKeys {
+		cfg.AddHostKey(k)
+	}
 	var ln net.Listener
 	require.Eventually(t, func() bool {
 		var err error
@@ -457,8 +462,16 @@ func TestReplica_OverSSHTunnel(t *testing.T) {
 	defer w.Close()
 	appendRecs(t, w, 1, 80)
 
+	// Like a real sshd the server also has an ECDSA host key, which the Go
+	// client would negotiate by default; known_hosts lists only the ED25519
+	// one. The dial must ask for the key type it can verify.
+	ecKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+	ecSigner, err := ssh.NewSignerFromKey(ecKey)
+	require.NoError(t, err)
+
 	defer startServer(t, primary, serveAddr)()
-	sshd := startSSHServer(t, sshAddr, hostSigner, clientSigner.PublicKey())
+	sshd := startSSHServer(t, sshAddr, hostSigner, clientSigner.PublicKey(), ecSigner)
 
 	tunnel := &SSHTunnelConfig{Host: sshAddr, User: "wal", KeyFile: keyFile,
 		KnownHostsFile: knownHosts, DialTimeout: 2 * time.Second}
@@ -476,7 +489,7 @@ func TestReplica_OverSSHTunnel(t *testing.T) {
 	time.Sleep(150 * time.Millisecond) // reconnect attempts fail meanwhile
 	require.Equal(t, uint64(100), replicaHead(t, replica))
 
-	sshd = startSSHServer(t, sshAddr, hostSigner, clientSigner.PublicKey())
+	sshd = startSSHServer(t, sshAddr, hostSigner, clientSigner.PublicKey(), ecSigner)
 	defer sshd.kill()
 	waitFor(t, "catch-up after ssh came back", func() bool { return replicaHead(t, replica) == 180 })
 	require.NoError(t, stopReplica())

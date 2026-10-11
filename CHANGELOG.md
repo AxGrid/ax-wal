@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.3.1 — 2026-10-11
+
+### Fixed
+
+- SSH tunnel: the client now asks the server for a host key type that is
+  present in `known_hosts`. Before, it could negotiate e.g. ECDSA while the
+  file listed only the host's ED25519 key and fail with
+  `knownhosts: key mismatch` on a host that plain `ssh` accepts. Found by
+  running a replica against a real sshd.
+
 ## v0.3.0 — 2026-10-11
 
 Replication: read-only replica over SSH with automatic reconnect, optional

@@ -111,6 +111,14 @@ func dialSSH(ctx context.Context, cfg *SSHTunnelConfig) (*ssh.Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("dial ssh tcp: %w", err)
 	}
+	// Ask the server for a host key type we actually have in known_hosts.
+	// Left to its defaults the client may negotiate e.g. ECDSA while the
+	// file only lists the host's ED25519 key, and fail with "key mismatch"
+	// on a host that plain `ssh` accepts.
+	if algos := knownHostKeyAlgorithms(hostKeyCallback, cfg.Host, tcpConn.RemoteAddr()); len(algos) > 0 {
+		clientCfg.HostKeyAlgorithms = algos
+	}
+
 	// ClientConfig.Timeout only covers ssh.Dial's TCP connect; bound the key
 	// exchange and auth ourselves so a peer that accepts and then goes
 	// silent can't hang the dial forever.
@@ -135,3 +143,41 @@ func makeHostKeyCallback(knownHostsFile string) (ssh.HostKeyCallback, error) {
 	}
 	return cb, nil
 }
+
+// knownHostKeyAlgorithms returns the host key algorithms for which the
+// known_hosts callback has an entry for this host (nil if none / not a
+// known_hosts callback). It probes the callback with a key that can't match
+// and reads the expected keys out of the resulting error.
+func knownHostKeyAlgorithms(cb ssh.HostKeyCallback, host string, remote net.Addr) []string {
+	var keyErr *knownhosts.KeyError
+	if err := cb(host, remote, probeHostKey{}); !errors.As(err, &keyErr) {
+		return nil
+	}
+	var algos []string
+	seen := map[string]bool{}
+	add := func(a string) {
+		if !seen[a] {
+			seen[a] = true
+			algos = append(algos, a)
+		}
+	}
+	for _, k := range keyErr.Want {
+		switch t := k.Key.Type(); t {
+		case ssh.KeyAlgoRSA:
+			// One RSA key serves all three signature schemes.
+			add(ssh.KeyAlgoRSASHA512)
+			add(ssh.KeyAlgoRSASHA256)
+			add(ssh.KeyAlgoRSA)
+		default:
+			add(t)
+		}
+	}
+	return algos
+}
+
+// probeHostKey is a public key of a type no host has.
+type probeHostKey struct{}
+
+func (probeHostKey) Type() string                        { return "axwal-probe" }
+func (probeHostKey) Marshal() []byte                     { return []byte("axwal-probe") }
+func (probeHostKey) Verify([]byte, *ssh.Signature) error { return errors.New("probe key") }
