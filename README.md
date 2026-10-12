@@ -715,10 +715,14 @@ other side.
   its own WAL, not a cursor on the primary, decides where to continue. A
   record is acknowledged to the primary only after it is on the replica's
   disk.
-- **SSH is the transport.** The replica dials SSH itself (key file or
-  agent, `known_hosts` verification) and reaches `axwal-serve` bound to
-  `127.0.0.1` on the primary through the tunnel — nothing but sshd is
-  exposed. A direct TCP address works too (WireGuard, private network).
+- **SSH or a shared key.** Either the replica dials SSH itself (key file
+  or agent, `known_hosts` verification) and reaches `axwal-serve` bound to
+  `127.0.0.1` through the tunnel; or both sides get the same 32-byte key
+  (`-transport-key-file`, `ServerOptions.TransportKey` /
+  `RemoteReaderOptions.TransportKey`) and talk plain TCP directly: mutual
+  authentication, AES-256-GCM, forward-secret session keys, at nearly the
+  speed of an unprotected connection. Without either, the protocol is open
+  — keep it on WireGuard or a private network.
 - **Self-healing.** Lost connection, restarted primary, restarted sshd:
   reconnects with backoff (1 s → 30 s) and catches up. A link that dies
   *silently* — no FIN, data just stops — is caught too: the server pings

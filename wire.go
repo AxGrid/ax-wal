@@ -60,6 +60,9 @@ type errPayload struct {
 	Error string `json:"error"`
 }
 
+// errSecureHello: a plain endpoint received the opening of a secure handshake.
+var errSecureHello = errors.New("axwal/wire: peer started a secure handshake, but no transport key is configured here")
+
 // writeFrame emits a single frame. Caller is responsible for serializing
 // concurrent writes on the same connection.
 func writeFrame(w io.Writer, magic [4]byte, body []byte) error {
@@ -69,15 +72,19 @@ func writeFrame(w io.Writer, magic [4]byte, body []byte) error {
 	var hdr [8]byte
 	copy(hdr[0:4], magic[:])
 	binary.BigEndian.PutUint32(hdr[4:8], uint32(len(body)))
+	// Small frames (ACK, PING, HELLO) go out in one write: one packet, and
+	// on an encrypted connection one sealed frame instead of two.
+	if len(body) <= 4096 {
+		buf := make([]byte, 0, len(hdr)+len(body))
+		buf = append(append(buf, hdr[:]...), body...)
+		_, err := w.Write(buf)
+		return err
+	}
 	if _, err := w.Write(hdr[:]); err != nil {
 		return err
 	}
-	if len(body) > 0 {
-		if _, err := w.Write(body); err != nil {
-			return err
-		}
-	}
-	return nil
+	_, err := w.Write(body)
+	return err
 }
 
 // readFrame returns the next frame's magic + body. On a clean connection
@@ -93,6 +100,11 @@ func readFrame(r io.Reader) ([4]byte, []byte, error) {
 		return magic, nil, fmt.Errorf("axwal/wire: header: %w", err)
 	}
 	copy(magic[:], hdr[0:4])
+	if magic == secureMagic {
+		// The peer is starting an encrypted session and we are not
+		// configured for one; what follows isn't a frame.
+		return magic, nil, errSecureHello
+	}
 	bodyLen := binary.BigEndian.Uint32(hdr[4:8])
 	if bodyLen > wireMaxBodyBytes {
 		return magic, nil, fmt.Errorf("axwal/wire: oversized body %d", bodyLen)

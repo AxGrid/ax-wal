@@ -171,6 +171,7 @@ rr, err := axwal.DialRemoteReader(ctx, axwal.RemoteReaderOptions{
 |---|---|---|
 | `Addr` | обязателен | Адрес `axwal-serve`. С туннелем — как его видит удалённый сервер. |
 | `SSHTunnel` | nil | Идти через SSH. Поля: `Host`, `User`, `KeyFile`, `KeyPassphrase`, `Agent`, `KnownHostsFile`, `DialTimeout`. |
+| `TransportKey` | nil | Общий ключ, 32 байта: взаимная проверка и шифрование прямого TCP-соединения. Должен совпадать с ключом сервера. См. `REPLICATION.md`. |
 | `Name` | обязателен | Имя курсора на стороне источника. |
 | `StartIndex` | 0 | С какой записи начать при первом подключении. 0 — с самой старой. |
 | `BatchSize` | 256 | Сколько записей сервер кладёт в одну пачку. |

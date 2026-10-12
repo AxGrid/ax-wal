@@ -24,13 +24,26 @@ import (
 
 func main() {
 	dir := flag.String("dir", "", "WAL directory (read-only access)")
-	listen := flag.String("listen", "127.0.0.1:9001", "TCP address to listen on (use 127.0.0.1 + SSH tunnel)")
+	listen := flag.String("listen", "127.0.0.1:9001", "TCP address to listen on (127.0.0.1 behind an SSH tunnel, or a network address together with -transport-key-file)")
 	keepalive := flag.Duration("keepalive", 15*time.Second, "PING interval on idle conns; 0 disables")
 	ackBatch := flag.Duration("ack-batch", 100*time.Millisecond, "AckBatchInterval forwarded to per-conn Reader")
+	transportKey := flag.String("transport-key-file", "", "32-byte key file: clients must hold the same key, and the connection is encrypted. Lets you listen on a network address without an SSH tunnel")
 	flag.Parse()
 
 	if *dir == "" {
 		log.Fatalf("-dir required")
+	}
+
+	var key []byte
+	if *transportKey != "" {
+		b, err := os.ReadFile(*transportKey)
+		if err != nil {
+			log.Fatalf("read transport key: %v", err)
+		}
+		if len(b) != 32 {
+			log.Fatalf("transport key file %s must be exactly 32 bytes, got %d", *transportKey, len(b))
+		}
+		key = b
 	}
 
 	ctx, cancel := signalCtx()
@@ -41,6 +54,7 @@ func main() {
 		Listen:            *listen,
 		KeepAliveInterval: *keepalive,
 		AckBatchInterval:  *ackBatch,
+		TransportKey:      key,
 	}); err != nil {
 		log.Fatalf("serve: %v", err)
 	}

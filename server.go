@@ -38,6 +38,14 @@ type ServerOptions struct {
 	// follower acks.
 	AckBatchInterval time.Duration
 
+	// TransportKey, if set (32 bytes), makes the endpoint safe to expose on
+	// a network without SSH or a VPN: every connection must prove it holds
+	// the same key before anything is exchanged, and all traffic is
+	// encrypted (AES-256-GCM, forward-secret session keys). Clients set the
+	// same key in RemoteReaderOptions.TransportKey. Connections that don't
+	// pass the handshake are dropped.
+	TransportKey []byte
+
 	// Writer, when the WAL is written by this same process, connects the
 	// server to it: replica acknowledgements reach the writer directly,
 	// which is what WriterOptions.SyncReplication waits for and what
@@ -63,6 +71,11 @@ func Serve(ctx context.Context, opts ServerOptions) error {
 	if opts.Dir == "" {
 		return errors.New("axwal: ServerOptions.Dir required")
 	}
+	if opts.TransportKey != nil {
+		if err := checkTransportKey(opts.TransportKey); err != nil {
+			return err
+		}
+	}
 	if opts.Listen == "" {
 		opts.Listen = "127.0.0.1:9001"
 	}
@@ -82,7 +95,13 @@ func Serve(ctx context.Context, opts ServerOptions) error {
 	if err != nil {
 		return fmt.Errorf("listen: %w", err)
 	}
-	log.Info("serving WAL", "dir", opts.Dir)
+	log.Info("serving WAL", "dir", opts.Dir, "encrypted", opts.TransportKey != nil)
+	if opts.TransportKey == nil {
+		if tcp, ok := ln.Addr().(*net.TCPAddr); ok && !tcp.IP.IsLoopback() {
+			log.Warn("listening on a non-loopback address WITHOUT a transport key: " +
+				"anyone who can reach this port can read the whole log; set TransportKey or bind to 127.0.0.1")
+		}
+	}
 
 	go func() {
 		<-ctx.Done()
@@ -144,8 +163,22 @@ func handleConn(ctx context.Context, opts ServerOptions, conn net.Conn, baseLog 
 	defer conn.Close()
 	log := baseLog.With("peer", conn.RemoteAddr().String())
 
+	if opts.TransportKey != nil {
+		sc, err := secureServer(conn, opts.TransportKey)
+		if err != nil {
+			log.Warn("connection rejected", "err", err)
+			return
+		}
+		conn = sc
+	}
+
 	// HELLO must arrive first.
 	magic, body, err := readFrame(conn)
+	if errors.Is(err, errSecureHello) {
+		_ = sendErr(conn, "this server has no transport key configured")
+		log.Warn("connection rejected: the peer uses a transport key, this server has none")
+		return
+	}
 	if err != nil {
 		log.Warn("hello read failed", "err", err)
 		return

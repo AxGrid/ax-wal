@@ -153,7 +153,9 @@ func RunReplica(ctx context.Context, opts ReplicaOptions) error {
 		if ctx.Err() != nil {
 			return nil
 		}
-		if errors.Is(err, ErrReplicaDiverged) {
+		if errors.Is(err, ErrReplicaDiverged) || errors.Is(err, ErrTransportAuth) {
+			// Neither gets better by retrying: the logs don't line up, or
+			// the two sides don't share a transport key.
 			return err
 		}
 		if progressed {

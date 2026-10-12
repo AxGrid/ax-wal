@@ -32,6 +32,12 @@ type RemoteReaderOptions struct {
 	// SSHTunnel, if non-nil, dials Addr through an SSH session.
 	SSHTunnel *SSHTunnelConfig
 
+	// TransportKey (32 bytes) must match ServerOptions.TransportKey when the
+	// server has one: the two sides authenticate each other with it and
+	// encrypt the connection. This is the way to replicate over plain TCP
+	// without an SSH tunnel. It can also be combined with SSHTunnel.
+	TransportKey []byte
+
 	// Name is the cursor name registered on the SOURCE WAL via HELLO. Stable
 	// names let the source remember progress across follower restarts.
 	Name string
@@ -207,6 +213,14 @@ func DialRemoteReader(ctx context.Context, opts RemoteReaderOptions) (*RemoteRea
 		_ = conn.SetDeadline(time.Now().Add(opts.DialTimeout))
 	}
 
+	if opts.TransportKey != nil {
+		sc, err := secureClient(conn, opts.TransportKey)
+		if err != nil {
+			return fail("%w", err)
+		}
+		conn = sc
+	}
+
 	hello := helloPayload{Name: opts.Name, StartIndex: opts.StartIndex, BatchSize: opts.BatchSize, Exact: opts.exact}
 	body, _ := json.Marshal(hello)
 	if err := writeFrame(conn, magicHello, body); err != nil {
@@ -219,6 +233,9 @@ func DialRemoteReader(ctx context.Context, opts RemoteReaderOptions) (*RemoteRea
 	if magic == magicErr {
 		var ep errPayload
 		_ = json.Unmarshal(body, &ep)
+		if ep.Error == errMsgKeyRequired {
+			return fail("%w: %s (set RemoteReaderOptions.TransportKey)", ErrTransportAuth, ep.Error)
+		}
 		return fail("server: %s", ep.Error)
 	}
 	if magic != magicOK {

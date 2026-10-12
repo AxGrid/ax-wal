@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.5.0 — 2026-10-12
+
+### Added
+
+- **Shared-key transport for replication over plain TCP** —
+  `ServerOptions.TransportKey` / `RemoteReaderOptions.TransportKey`
+  (`-transport-key-file` on `axwal-serve` and `axwal-mirror`). Both sides
+  prove they hold the same 32-byte key, session keys come from an ephemeral
+  X25519 exchange (forward secrecy), and all traffic is sealed with
+  AES-256-GCM; a tampered, replayed, dropped or reordered frame kills the
+  connection. A wrong or missing key is reported as `ErrTransportAuth`,
+  naming the misconfigured side, and a replica stops instead of retrying
+  forever. Measured on localhost in synchronous mode: 51 µs per round trip,
+  against 49 µs unprotected and 79 µs through SSH.
+- `axwal-serve` warns when it listens on a non-loopback address without a
+  transport key.
+
 ## v0.4.1 — 2026-10-12
 
 Archive integrity: a reader must never return a result with records

@@ -60,6 +60,7 @@ func main() {
 	sshKeyPass := flag.String("ssh-key-pass", "", "passphrase for an encrypted SSH key")
 	sshAgent := flag.Bool("ssh-agent", false, "use SSH_AUTH_SOCK as an additional auth method")
 	sshKnownHosts := flag.String("ssh-known-hosts", "", "path to OpenSSH known_hosts (empty = INSECURE: skip host-key verification)")
+	transportKey := flag.String("transport-key-file", "", "REMOTE: 32-byte key shared with axwal-serve -transport-key-file — mutual authentication and encryption for a direct TCP connection (no SSH needed)")
 
 	replica := flag.Bool("replica", false, "REMOTE: keep -dst as an exact READ-ONLY replica (same indices as the primary, reconnects by itself, no other writer allowed until `axwal-cli promote`). Requires -addr and an empty or replica -dst")
 
@@ -149,6 +150,9 @@ func main() {
 			Addr:      *addr,
 			Name:      *name,
 			BatchSize: *batch,
+		}
+		if k := loadKeyFile(*transportKey); k != nil {
+			opts.SrcRemote.TransportKey = k.Key
 		}
 		if *tunnel != "" {
 			user, host := parseTunnel(*tunnel)
