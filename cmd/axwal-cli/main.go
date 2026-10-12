@@ -1,7 +1,8 @@
 // axwal-cli is the admin tool for inspecting and manipulating a WAL directory.
 //
 //	axwal-cli ls -dir /path/to/wal              # list segments + sizes + archived?
-//	axwal-cli cursors -dir /path/to/wal         # list reader cursors + heartbeat age
+//	axwal-cli readers -dir /path/to/wal [-watch] # readers: position, lag, speed
+//	axwal-cli cursors -dir /path/to/wal         # reader positions only
 //	axwal-cli verify -dir /path/to/wal          # CRC-walk every segment
 //	axwal-cli tail -dir /path/to/wal -name dbg  # follow live (Ctrl-C to stop)
 //	axwal-cli mark-archived -dir X -range 1-100 # touch wal-1-100.archived
@@ -44,6 +45,8 @@ func main() {
 		cmdLs(args)
 	case "cursors":
 		cmdCursors(args)
+	case "readers":
+		cmdReaders(args)
 	case "verify":
 		cmdVerify(args)
 	case "tail":
@@ -78,7 +81,8 @@ func usage() {
 
 Subcommands:
   ls              list segments in a WAL directory
-  cursors         list reader cursors and their heartbeat age
+  readers         every reader: position, lag, speed, time to catch up (-watch to follow)
+  cursors         reader positions only (same table, no speed measurement)
   stats           summary table: head index, segments, total bytes, per-cursor lag
   verify          CRC-scan every segment, report bad records
   fsck            verify + remove bad segments and dedupe twins (--fix to apply)
@@ -208,8 +212,211 @@ func cmdLs(args []string) {
 	fmt.Printf("\n%d segment(s), total size %s, %d closed records\n", len(rows), humanBytes(totalSize), totalRecs)
 }
 
-// ---------------- cursors ----------------
+// ---------------- readers / cursors ----------------
 
+type readerSample struct {
+	at      time.Time
+	head    uint64
+	cursors map[string]uint64
+}
+
+func sampleReaders(dir string) (readerSample, axwal.LogInfo, []axwal.CursorInfo) {
+	info, err := axwal.InspectLog(dir)
+	if err != nil {
+		fatal("inspect log: %v", err)
+	}
+	cursors, err := axwal.ListCursors(dir)
+	if err != nil {
+		fatal("list cursors: %v", err)
+	}
+	s := readerSample{at: time.Now(), head: info.LastIndex, cursors: map[string]uint64{}}
+	for _, c := range cursors {
+		s.cursors[c.Name] = c.Index
+	}
+	return s, info, cursors
+}
+
+func perSecond(delta uint64, d time.Duration) float64 {
+	if d <= 0 {
+		return 0
+	}
+	return float64(delta) / d.Seconds()
+}
+
+func fmtRate(r float64) string {
+	switch {
+	case r <= 0:
+		return "0/s"
+	case r < 10:
+		return fmt.Sprintf("%.1f/s", r)
+	default:
+		return fmt.Sprintf("%.0f/s", r)
+	}
+}
+
+func fmtETA(secs float64) string {
+	switch {
+	case secs < 1:
+		return "<1s"
+	case secs < 120:
+		return fmt.Sprintf("%.0fs", secs)
+	case secs < 2*3600:
+		return fmt.Sprintf("%.0fm", secs/60)
+	case secs < 2*86400:
+		return fmt.Sprintf("%.1fh", secs/3600)
+	default:
+		return fmt.Sprintf("%.1fd", secs/86400)
+	}
+}
+
+// printReaders renders one snapshot. prev may be zero (no rates then).
+func printReaders(dir string, prev, cur readerSample, info axwal.LogInfo, cursors []axwal.CursorInfo, staleTTL time.Duration) {
+	haveRates := !prev.at.IsZero()
+	dt := cur.at.Sub(prev.at)
+	writeRate := 0.0
+	if haveRates && cur.head >= prev.head {
+		writeRate = perSecond(cur.head-prev.head, dt)
+	}
+	fmt.Printf("log: %s   records %d..%d   %d segment(s), %s", dir, info.FirstIndex, info.LastIndex, info.Segments, humanBytes(info.Bytes))
+	if haveRates {
+		fmt.Printf("   writing %s", fmtRate(writeRate))
+	}
+	fmt.Println()
+	if len(cursors) == 0 {
+		fmt.Println("(no readers registered)")
+		return
+	}
+	fmt.Printf("\n%-28s %12s %12s %10s %-15s %10s %-6s %8s\n",
+		"READER", "ACKED", "LAG", "SPEED", "CATCH-UP", "HEARTBEAT", "STATE", "PID")
+	for _, c := range cursors {
+		var lag uint64
+		if info.LastIndex > c.Index {
+			lag = info.LastIndex - c.Index
+		}
+		age := cur.at.Sub(c.LastHeartbeat)
+		state := "alive"
+		if age > staleTTL {
+			state = "stale"
+		}
+		speed, catchUp := "-", "-"
+		if haveRates {
+			rate := 0.0
+			if was, ok := prev.cursors[c.Name]; ok && c.Index >= was {
+				rate = perSecond(c.Index-was, dt)
+			}
+			speed = fmtRate(rate)
+			switch {
+			case lag == 0:
+				catchUp = "caught up"
+			case state == "stale":
+				catchUp = "not running"
+			case rate == 0:
+				catchUp = "not moving"
+			case float64(lag) <= 2*rate:
+				// Less than two seconds of its own work behind: that is
+				// ack batching and polling, not a backlog.
+				catchUp = "keeping up"
+			case rate <= writeRate*1.02:
+				catchUp = "falling behind"
+			default:
+				catchUp = "in " + fmtETA(float64(lag)/(rate-writeRate))
+			}
+		} else if lag == 0 {
+			catchUp = "caught up"
+		}
+		fmt.Printf("%-28s %12d %12d %10s %-15s %10s %-6s %8d\n",
+			c.Name, c.Index, lag, speed, catchUp, formatAge(int64(age.Seconds()))+" ago", state, c.PID)
+	}
+}
+
+// cmdReaders lists every reader of a WAL with its position, lag and speed.
+func cmdReaders(args []string) {
+	fs := flag.NewFlagSet("readers", flag.ExitOnError)
+	dir := fs.String("dir", "", "WAL directory")
+	interval := fs.Duration("interval", time.Second, "how long to observe to measure speed (0 = positions only, no speed)")
+	watch := fs.Bool("watch", false, "keep refreshing every -interval until Ctrl-C")
+	staleTTL := fs.Duration("stale-ttl", 60*time.Second, "heartbeat age after which a reader is shown as stale (the writer's Retention.StaleReaderTTL)")
+	asJSON := fs.Bool("json", false, "machine-readable output (one JSON object per snapshot)")
+	fs.Parse(args)
+	if *dir == "" {
+		fatal("readers: -dir required")
+	}
+	if *watch && *interval <= 0 {
+		fatal("readers: -watch needs -interval > 0")
+	}
+	ctx, cancel := signalContext()
+	defer cancel()
+
+	emit := func(prev, cur readerSample, info axwal.LogInfo, cursors []axwal.CursorInfo) {
+		if !*asJSON {
+			printReaders(*dir, prev, cur, info, cursors, *staleTTL)
+			return
+		}
+		type row struct {
+			Name          string   `json:"name"`
+			Acked         uint64   `json:"acked"`
+			Lag           uint64   `json:"lag"`
+			Speed         *float64 `json:"speed_per_sec,omitempty"`
+			HeartbeatAgeS float64  `json:"heartbeat_age_sec"`
+			Stale         bool     `json:"stale"`
+			PID           int      `json:"pid"`
+		}
+		out := struct {
+			First      uint64   `json:"first_index"`
+			Last       uint64   `json:"last_index"`
+			Segments   int      `json:"segments"`
+			Bytes      int64    `json:"bytes"`
+			WriteSpeed *float64 `json:"write_speed_per_sec,omitempty"`
+			Readers    []row    `json:"readers"`
+		}{First: info.FirstIndex, Last: info.LastIndex, Segments: info.Segments, Bytes: info.Bytes, Readers: []row{}}
+		dt := cur.at.Sub(prev.at)
+		if !prev.at.IsZero() && cur.head >= prev.head {
+			w := perSecond(cur.head-prev.head, dt)
+			out.WriteSpeed = &w
+		}
+		for _, c := range cursors {
+			r := row{Name: c.Name, Acked: c.Index, PID: c.PID,
+				HeartbeatAgeS: cur.at.Sub(c.LastHeartbeat).Seconds()}
+			r.Stale = cur.at.Sub(c.LastHeartbeat) > *staleTTL
+			if info.LastIndex > c.Index {
+				r.Lag = info.LastIndex - c.Index
+			}
+			if was, ok := prev.cursors[c.Name]; ok && !prev.at.IsZero() && c.Index >= was {
+				sp := perSecond(c.Index-was, dt)
+				r.Speed = &sp
+			}
+			out.Readers = append(out.Readers, r)
+		}
+		_ = json.NewEncoder(os.Stdout).Encode(out)
+	}
+
+	prev, info, cursors := sampleReaders(*dir)
+	if *interval <= 0 {
+		emit(readerSample{}, prev, info, cursors)
+		return
+	}
+	for {
+		t := time.NewTimer(*interval)
+		select {
+		case <-ctx.Done():
+			t.Stop()
+			return
+		case <-t.C:
+		}
+		cur, info, cursors := sampleReaders(*dir)
+		if *watch && !*asJSON {
+			fmt.Print("\033[H\033[2J") // clear the screen for each refresh
+			fmt.Printf("%s   (every %s, Ctrl-C to stop)\n", cur.at.Format("15:04:05"), *interval)
+		}
+		emit(prev, cur, info, cursors)
+		if !*watch {
+			return
+		}
+		prev = cur
+	}
+}
+
+// cmdCursors is the short form: positions only, no measuring.
 func cmdCursors(args []string) {
 	fs := flag.NewFlagSet("cursors", flag.ExitOnError)
 	dir := fs.String("dir", "", "WAL directory")
@@ -217,56 +424,8 @@ func cmdCursors(args []string) {
 	if *dir == "" {
 		fatal("cursors: -dir required")
 	}
-
-	cdir := filepath.Join(*dir, "cursors")
-	entries, err := os.ReadDir(cdir)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			fmt.Println("(no cursors directory)")
-			return
-		}
-		fatal("readdir: %v", err)
-	}
-
-	type rec struct {
-		Name              string `json:"name"`
-		Index             uint64 `json:"index"`
-		PID               int    `json:"pid"`
-		StartedAtUnix     int64  `json:"started_at_unix"`
-		LastHeartbeatUnix int64  `json:"last_heartbeat_unix"`
-	}
-	var rows []rec
-	for _, e := range entries {
-		if !strings.HasSuffix(e.Name(), ".cursor") {
-			continue
-		}
-		body, err := os.ReadFile(filepath.Join(cdir, e.Name()))
-		if err != nil {
-			continue
-		}
-		var r rec
-		if err := json.Unmarshal(body, &r); err != nil {
-			continue
-		}
-		rows = append(rows, r)
-	}
-	sort.Slice(rows, func(i, j int) bool { return rows[i].Name < rows[j].Name })
-
-	if len(rows) == 0 {
-		fmt.Println("(no cursors)")
-		return
-	}
-	now := time.Now().Unix()
-	fmt.Printf("%-20s %12s %8s %16s %12s\n", "name", "index", "pid", "heartbeat-age", "status")
-	for _, r := range rows {
-		age := now - r.LastHeartbeatUnix
-		ageStr := formatAge(age)
-		status := "alive"
-		if age > 60 {
-			status = "stale"
-		}
-		fmt.Printf("%-20s %12d %8d %16s %12s\n", r.Name, r.Index, r.PID, ageStr, status)
-	}
+	cur, info, cursors := sampleReaders(*dir)
+	printReaders(*dir, readerSample{}, cur, info, cursors, 60*time.Second)
 }
 
 // ---------------- verify ----------------
@@ -854,6 +1013,43 @@ func cmdPromote(args []string) {
 	fmt.Printf("%s is now a writable WAL\n", *dir)
 }
 
+func printArchiveCheck(res *axwal.ArchiveCheckResult, deep, withDir bool) {
+	how := "existence of each object"
+	if deep {
+		how = "full download: checksum, decryption, record CRCs, counts"
+	}
+	if res.HasManifest {
+		fmt.Printf("archive:  %d segment(s), indices %d..%d, %s  (checked: %s)\n",
+			res.Segments, res.FirstIndex, res.LastIndex, humanBytes(res.Bytes), how)
+	} else {
+		fmt.Printf("archive:  no manifest — compared against the local directory only  (checked: %s)\n", how)
+	}
+	for _, g := range res.Gaps {
+		fmt.Printf("GAP       indices %s are not covered by any segment in the manifest\n", g)
+	}
+	for _, p := range res.Problems {
+		kind := "DAMAGED "
+		if p.Missing {
+			kind = "MISSING "
+		}
+		fmt.Printf("%s  indices %s  %s  %s\n", kind, p.IndexRange, p.Key, p.Detail)
+	}
+	if withDir {
+		fmt.Printf("local:    last closed index %d, %d segment(s) waiting for upload\n", res.LocalLastIndex, len(res.LocalPending))
+		for _, l := range res.LocalLost {
+			fmt.Printf("LOST      indices %s are marked .archived on disk but not intact in the archive\n", l)
+		}
+		for _, r := range res.Repaired {
+			fmt.Printf("REPAIRED  indices %s un-marked; the writer will upload them again\n", r)
+		}
+	}
+	if res.OK() {
+		fmt.Println("ok")
+	} else {
+		fmt.Println("PROBLEMS FOUND")
+	}
+}
+
 // ---------------- archive ----------------
 
 // cmdArchive prints the catalog of an archive: what is in the bucket, which
@@ -863,6 +1059,10 @@ func cmdArchive(args []string) {
 	storeURL := fs.String("store", "", "archive location: b2://bucket/prefix, s3://bucket/prefix, file:///dir")
 	asJSON := fs.Bool("json", false, "print the manifest as JSON")
 	archiveKey := archiveKeyFlag(fs)
+	check := fs.Bool("check", false, "verify the archive: no holes, every object present; exits 1 if something is wrong")
+	deep := fs.Bool("deep", false, "with -check: download every object and verify checksum, decryption, record CRCs and counts")
+	dir := fs.String("dir", "", "with -check: the writer's WAL directory — also verify that everything marked .archived there is really in the archive")
+	repair := fs.Bool("repair", false, "with -check -dir: un-mark local segments that are missing or damaged in the archive, so the writer uploads them again")
 	fs.Parse(args)
 	if *storeURL == "" {
 		fatal("archive: -store required")
@@ -873,6 +1073,20 @@ func cmdArchive(args []string) {
 	}
 	ctx, cancel := signalContext()
 	defer cancel()
+	if *check {
+		res, err := axwal.CheckArchive(ctx, axwal.ArchiveCheckOptions{
+			Store: store, Prefix: prefix, ArchiveEncryption: loadArchiveKey(*archiveKey),
+			Dir: *dir, Deep: *deep, Repair: *repair,
+		})
+		if err != nil {
+			fatal("check: %v", err)
+		}
+		printArchiveCheck(res, *deep, *dir != "")
+		if !res.OK() {
+			os.Exit(1)
+		}
+		return
+	}
 	var m *axwal.ArchiveManifest
 	if enc := loadArchiveKey(*archiveKey); enc != nil {
 		m, err = axwal.LoadEncryptedArchiveManifest(ctx, store, prefix, *enc)

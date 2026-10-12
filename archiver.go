@@ -40,6 +40,7 @@ type archiver struct {
 	// manMu serializes manifest read-modify-write cycles.
 	manMu    sync.Mutex
 	manifest *ArchiveManifest // nil until loaded from the store
+	head     *archiveHead     // same, for encrypted archives without a manifest
 
 	pending      atomic.Int64
 	pendingBytes atomic.Int64
@@ -356,6 +357,14 @@ func (a *archiver) upload(ctx context.Context, ps pendingSeg) (key string, err e
 	}
 	entry.Key = key
 
+	// The catalog must exist — declaring where the log starts — before the
+	// first segment becomes visible. Otherwise a reader arriving at the
+	// wrong moment would take whichever segment landed first for the
+	// beginning of the log.
+	if err := a.ensureCatalog(ctx); err != nil {
+		return key, fmt.Errorf("catalog: %w", err)
+	}
+
 	// An earlier attempt may have uploaded the object and then failed on a
 	// later step; don't send it again.
 	existing, found, err := statObject(ctx, a.cfg.Store, key)
@@ -386,6 +395,14 @@ func (a *archiver) upload(ctx context.Context, ps pendingSeg) (key string, err e
 		entry.UploadedAtUnix = time.Now().Unix()
 		if err := a.recordInManifest(ctx, entry); err != nil {
 			return key, fmt.Errorf("manifest: %w", err)
+		}
+	}
+	if a.cfg.DisableManifest && a.cfg.crypto != nil {
+		// No manifest, and the object names say nothing: leave at least a
+		// marker of how far the archive goes, so a reader can tell a missing
+		// object from the end of the log.
+		if err := a.recordHead(ctx, seg.FirstIndex, seg.LastIndex); err != nil {
+			return key, fmt.Errorf("head: %w", err)
 		}
 	}
 
@@ -443,24 +460,96 @@ func objectMatches(o ArchiveObject, info ArchivePutInfo) bool {
 	return o.SHA1 == "" || strings.EqualFold(o.SHA1, info.SHA1)
 }
 
-func (a *archiver) recordInManifest(ctx context.Context, entry ArchiveSegment) error {
+// ensureCatalog loads the manifest (or, for an encrypted archive without
+// one, the head marker) and, if the archive is brand new, creates it with
+// the index the log starts at. No-op once done.
+func (a *archiver) ensureCatalog(ctx context.Context) error {
 	a.manMu.Lock()
 	defer a.manMu.Unlock()
-	if a.manifest == nil {
+	return a.ensureCatalogLocked(ctx)
+}
+
+func (a *archiver) ensureCatalogLocked(ctx context.Context) error {
+	switch {
+	case !a.cfg.DisableManifest:
+		if a.manifest != nil {
+			return nil
+		}
 		m, err := getManifest(ctx, a.cfg.Store, a.cfg.Prefix, a.cfg.crypto)
 		switch {
 		case err == nil:
 		case errors.Is(err, ErrObjectNotFound):
-			m = &ArchiveManifest{}
+			m = &ArchiveManifest{FirstIndex: a.localFirstIndex()}
+			if err := putManifest(ctx, a.cfg.Store, a.cfg.Prefix, m, a.cfg.crypto); err != nil {
+				return err
+			}
 		default:
 			// Don't guess: starting from an empty manifest here would wipe
 			// the catalog of everything uploaded before.
 			return fmt.Errorf("load: %w", err)
 		}
 		a.manifest = m
+
+	case a.cfg.crypto != nil:
+		if a.head != nil {
+			return nil
+		}
+		h, err := getArchiveHead(ctx, a.cfg.Store, a.cfg.Prefix, a.cfg.crypto)
+		switch {
+		case err == nil:
+		case errors.Is(err, ErrObjectNotFound):
+			h = archiveHead{FirstIndex: a.localFirstIndex()}
+			if err := putArchiveHead(ctx, a.cfg.Store, a.cfg.Prefix, a.cfg.crypto, h); err != nil {
+				return err
+			}
+		default:
+			return fmt.Errorf("load: %w", err)
+		}
+		a.head = &h
+	}
+	return nil
+}
+
+func (a *archiver) recordInManifest(ctx context.Context, entry ArchiveSegment) error {
+	a.manMu.Lock()
+	defer a.manMu.Unlock()
+	if err := a.ensureCatalogLocked(ctx); err != nil {
+		return err
 	}
 	a.manifest.upsert(entry)
 	return putManifest(ctx, a.cfg.Store, a.cfg.Prefix, a.manifest, a.cfg.crypto)
+}
+
+// localFirstIndex is the first record of the oldest closed segment on disk,
+// uploaded or not (0 if there is none).
+func (a *archiver) localFirstIndex() uint64 {
+	matches, _ := filepath.Glob(filepath.Join(a.w.dir, "wal-*"))
+	var first uint64
+	for _, p := range matches {
+		s, err := parseSegName(filepath.Base(p))
+		if err != nil || !s.Closed || s.LastIndex < s.FirstIndex {
+			continue
+		}
+		if first == 0 || s.FirstIndex < first {
+			first = s.FirstIndex
+		}
+	}
+	return first
+}
+
+func (a *archiver) recordHead(ctx context.Context, first, last uint64) error {
+	a.manMu.Lock()
+	defer a.manMu.Unlock()
+	if err := a.ensureCatalogLocked(ctx); err != nil {
+		return err
+	}
+	if a.head.FirstIndex == 0 || first < a.head.FirstIndex {
+		a.head.FirstIndex = first
+	}
+	if last > a.head.LastIndex {
+		a.head.LastIndex = last
+	}
+	return putArchiveHead(ctx, a.cfg.Store, a.cfg.Prefix, a.cfg.crypto, *a.head)
 }
 
 // drain waits until nothing is pending, for at most d (d <= 0: no limit).

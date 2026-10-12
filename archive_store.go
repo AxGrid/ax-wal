@@ -214,8 +214,18 @@ type ArchiveSegment struct {
 // ArchiveManifest is the catalog of an archive prefix, stored as
 // <prefix>/manifest.json and rewritten by the archiver after every upload.
 type ArchiveManifest struct {
-	Version       int              `json:"version"`
-	UpdatedAtUnix int64            `json:"updated_at_unix"`
+	Version       int   `json:"version"`
+	UpdatedAtUnix int64 `json:"updated_at_unix"`
+
+	// FirstIndex is the index the archive is supposed to start at: the
+	// first record of the oldest segment the writer still had on disk when
+	// it created the manifest. Uploads run in parallel and can land out of
+	// order, so "the lowest segment listed right now" is not a safe answer
+	// to "where does the log begin" — with FirstIndex a reader can tell
+	// that the beginning simply hasn't arrived yet (or is missing). Zero in
+	// manifests written before this field existed.
+	FirstIndex uint64 `json:"first_index,omitempty"`
+
 	Segments      []ArchiveSegment `json:"segments"` // sorted by FirstIndex
 }
 
@@ -380,4 +390,48 @@ func statObject(ctx context.Context, store ArchiveStore, key string) (obj Archiv
 		}
 	}
 	return ArchiveObject{}, false, nil
+}
+
+// archiveHead is the minimal catalog of an encrypted archive that has no
+// manifest: where the log starts and how far it has been uploaded. It lets a
+// reader walking the chain of derived object names start at the right index
+// and tell "one object is missing" from "the log ends here".
+type archiveHead struct {
+	FirstIndex    uint64 `json:"first_index"`
+	LastIndex     uint64 `json:"last_index"`
+	UpdatedAtUnix int64  `json:"updated_at_unix"`
+}
+
+func getArchiveHead(ctx context.Context, store ArchiveStore, prefix string, crypto *archiveCrypto) (archiveHead, error) {
+	var h archiveHead
+	rc, err := store.Get(ctx, archiveKey(prefix, crypto.headName()))
+	if err != nil {
+		return h, err
+	}
+	defer rc.Close()
+	body, err := io.ReadAll(crypto.decryptReader(rc))
+	if err != nil {
+		return h, err
+	}
+	return h, json.Unmarshal(body, &h)
+}
+
+func putArchiveHead(ctx context.Context, store ArchiveStore, prefix string, crypto *archiveCrypto, h archiveHead) error {
+	h.UpdatedAtUnix = time.Now().Unix()
+	plain, err := json.Marshal(h)
+	if err != nil {
+		return err
+	}
+	plainSum := sha256.Sum256(plain)
+	var enc bytes.Buffer
+	if err := crypto.encrypt(&enc, bytes.NewReader(plain), crypto.saltFor("head", plainSum[:])); err != nil {
+		return err
+	}
+	s1 := sha1.Sum(enc.Bytes())
+	s256 := sha256.Sum256(enc.Bytes())
+	return store.Put(ctx, archiveKey(prefix, crypto.headName()), bytes.NewReader(enc.Bytes()), ArchivePutInfo{
+		Size:   int64(enc.Len()),
+		SHA1:   hex.EncodeToString(s1[:]),
+		SHA256: hex.EncodeToString(s256[:]),
+	})
 }

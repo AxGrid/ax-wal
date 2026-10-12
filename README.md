@@ -402,6 +402,27 @@ names follow from the key and the index it wants. Details, the on-wire
 format and what an observer can still see (in Russian):
 [docs/ARCHIVE_ENCRYPTION.md](docs/ARCHIVE_ENCRYPTION.md).
 
+#### Holes and verification
+
+An archive reader never passes over missing records silently. If records
+it was asked for aren't there while later ones are, `Next` returns
+`ErrArchiveGap` with the exact index range (sticky); `SkipMissing: true`
+turns that into a logged, counted jump (`Stats().SkippedRecords`). To make
+this reliable the writer records where the archive starts *before* the
+first segment is uploaded — uploads run in parallel and land out of order,
+so "the lowest segment listed right now" is not the beginning of the log.
+
+```bash
+axwal-cli archive -store b2://bucket/wal/prod -check              # no holes, every object present
+axwal-cli archive -store b2://bucket/wal/prod -check -deep        # + download and verify every object
+axwal-cli archive -store b2://bucket/wal/prod -check -dir /var/wal -repair
+```
+
+With `-dir` the check also compares against the writer's directory:
+everything marked `.archived` there must really be in the archive.
+`-repair` un-marks what is missing or damaged, and the writer uploads it
+again. Library: `axwal.CheckArchive`.
+
 #### Reading from the archive
 
 ```go
@@ -875,6 +896,7 @@ go run ./cmd/axwal-mirror -tunnel root@primary:22 -ssh-agent \
 
 # Admin
 go run ./cmd/axwal-cli ls -dir /tmp/wal
+go run ./cmd/axwal-cli readers -dir /tmp/wal -watch     # every reader: position, lag, speed, catch-up time
 go run ./cmd/axwal-cli cursors -dir /tmp/wal
 go run ./cmd/axwal-cli stats -dir /tmp/wal
 go run ./cmd/axwal-cli verify -dir /tmp/wal

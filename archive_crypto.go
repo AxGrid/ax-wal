@@ -89,6 +89,11 @@ func (c *archiveCrypto) manifestName() string {
 	return hex.EncodeToString(hmacSum(c.nameKey, []byte("manifest"))[:16])
 }
 
+// headName is the object name of the encrypted head marker (see archiveHead).
+func (c *archiveCrypto) headName() string {
+	return hex.EncodeToString(hmacSum(c.nameKey, []byte("head"))[:16])
+}
+
 // saltFor derives the per-object salt from the object's identity and the
 // SHA-256 of its plaintext. Deterministic on purpose: re-encrypting the same
 // file yields the same bytes, so a retried upload can be recognized as

@@ -603,3 +603,55 @@ func TestReaderScenario_ReturnAfterAbsence(t *testing.T) {
 	}
 	mustWait(t, r)
 }
+
+func TestListCursorsAndInspectLog(t *testing.T) {
+	dir := t.TempDir()
+	info, err := InspectLog(dir)
+	require.NoError(t, err)
+	require.Equal(t, LogInfo{}, info)
+	cs, err := ListCursors(dir)
+	require.NoError(t, err)
+	require.Empty(t, cs)
+
+	w := scenarioWriter(t, dir, WriterOptions{})
+	info, err = InspectLog(dir)
+	require.NoError(t, err)
+	require.Zero(t, info.LastIndex, "open but empty")
+	appendRecs(t, w, 1, 37)
+	w.awaitRotations()
+
+	a := scenarioReader(t, dir, ReaderOptions{Name: "alpha"})
+	scenarioReader(t, dir, ReaderOptions{Name: "beta"})
+	for i := uint64(1); i <= 12; i++ {
+		mustNext(t, a, i)
+	}
+	require.NoError(t, a.Ack(12))
+
+	info, err = InspectLog(dir)
+	require.NoError(t, err)
+	require.Equal(t, uint64(1), info.FirstIndex)
+	require.Equal(t, uint64(37), info.LastIndex, "includes the open segment")
+	require.Equal(t, 4, info.Segments)
+	require.Positive(t, info.Bytes)
+
+	cs, err = ListCursors(dir)
+	require.NoError(t, err)
+	require.Len(t, cs, 2)
+	require.Equal(t, "alpha", cs[0].Name)
+	require.Equal(t, uint64(12), cs[0].Index)
+	require.Equal(t, os.Getpid(), cs[0].PID)
+	require.WithinDuration(t, time.Now(), cs[0].LastHeartbeat, 5*time.Second)
+	require.Equal(t, "beta", cs[1].Name)
+	require.Zero(t, cs[1].Index)
+
+	// Looking must not register anything.
+	entries, err := os.ReadDir(filepath.Join(dir, cursorsSubdir))
+	require.NoError(t, err)
+	n := 0
+	for _, e := range entries {
+		if filepath.Ext(e.Name()) == ".cursor" {
+			n++
+		}
+	}
+	require.Equal(t, 2, n)
+}

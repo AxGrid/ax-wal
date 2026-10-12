@@ -879,7 +879,13 @@ func (r *Reader) waitForChange(ctx context.Context) error {
 }
 
 func (r *Reader) listSegments() ([]segName, error) {
-	matches, err := filepath.Glob(filepath.Join(r.dir, "wal-*"))
+	return listSegmentsIn(r.dir)
+}
+
+// listSegmentsIn returns every segment file in dir (open and closed, any
+// compression), sorted by FirstIndex.
+func listSegmentsIn(dir string) ([]segName, error) {
+	matches, err := filepath.Glob(filepath.Join(dir, "wal-*"))
 	if err != nil {
 		return nil, err
 	}
@@ -915,6 +921,11 @@ func (r *Reader) scanLastIndex() (uint64, error) {
 	if err != nil {
 		return 0, err
 	}
+	return lastIndexOf(r.dir, segs)
+}
+
+// lastIndexOf returns the highest record index in the given segments of dir.
+func lastIndexOf(dir string, segs []segName) (uint64, error) {
 	if len(segs) == 0 {
 		return 0, nil
 	}
@@ -930,7 +941,7 @@ func (r *Reader) scanLastIndex() (uint64, error) {
 	if last.Closed || last.FirstIndex <= best {
 		return best, nil
 	}
-	idx, _, err := readOpenSegmentTail(filepath.Join(r.dir, last.Name), last.FirstIndex, discardLog)
+	idx, _, err := readOpenSegmentTail(filepath.Join(dir, last.Name), last.FirstIndex, discardLog)
 	if err != nil {
 		return 0, err
 	}

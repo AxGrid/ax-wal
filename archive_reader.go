@@ -16,6 +16,13 @@ import (
 	"github.com/klauspost/compress/zstd"
 )
 
+// ErrArchiveGap is returned by an ArchiveReader when records it was asked for
+// are not in the archive although later ones are: a segment is absent from
+// the catalog, or listed there but its object is gone from the store. The
+// error names the missing index range. With ArchiveReaderOptions.SkipMissing
+// the reader jumps over such holes instead.
+var ErrArchiveGap = errors.New("axwal: records are missing from the archive")
+
 // ArchiveReaderOptions configures an ArchiveReader.
 type ArchiveReaderOptions struct {
 	// Store / Prefix locate the archive (same values as in ArchiveConfig).
@@ -70,8 +77,28 @@ type ArchiveReaderOptions struct {
 	// warning and skips ahead. Default 10m.
 	GapTimeout time.Duration
 
+	// SkipMissing decides what happens at a hole in the archive.
+	//
+	// false (default): Next returns ErrArchiveGap, and keeps returning it.
+	// A reader that walks the log to recount or search something must not
+	// silently produce a result with records missing.
+	//
+	// true: the reader logs a warning with the missing range, adds it to
+	// Stats().SkippedRecords and continues with the next records that exist.
+	// (Not possible without a manifest: there the reader can't know where
+	// the segment after a missing one starts, so it always stops.)
+	SkipMissing bool
+
 	// Logger defaults to slog.Default().
 	Logger *slog.Logger
+}
+
+// ArchiveReaderStats is a snapshot of an ArchiveReader's progress.
+type ArchiveReaderStats struct {
+	// NextIndex is the lowest index not yet returned.
+	NextIndex uint64
+	// SkippedRecords counts records jumped over because of SkipMissing.
+	SkippedRecords uint64
 }
 
 // ArchiveReader reads records straight from an archive, downloading the
@@ -94,6 +121,7 @@ type ArchiveReader struct {
 	chain       bool
 	chainNext   uint64
 	warnedEmpty bool
+	skipped     uint64
 
 	// Currently open segment.
 	body   io.Closer // HTTP body of a streamed (encrypted) segment
@@ -142,6 +170,11 @@ func OpenArchiveReader(ctx context.Context, opts ArchiveReaderOptions) (*Archive
 		}
 		r.log.Info("encrypted archive has no manifest; walking the segment chain from index 1")
 		r.chain, r.chainNext, err = true, 1, nil
+		// An archive written without a manifest still has a small "head"
+		// object saying where it starts and how far it goes.
+		if head, herr := getArchiveHead(ctx, opts.Store, opts.Prefix, crypto); herr == nil && head.FirstIndex > 1 {
+			r.chainNext = head.FirstIndex
+		}
 	}
 	if err != nil {
 		return nil, err
@@ -158,6 +191,31 @@ func (r *ArchiveReader) reload(ctx context.Context) error {
 		return err
 	}
 	r.segs = m.Segments
+	// Reading "from the beginning" means from where the archive is declared
+	// to begin, so that a first segment that hasn't been uploaded yet (or is
+	// gone) shows up as a hole instead of being silently left out.
+	if r.nextIdx == 0 && !r.started && m.FirstIndex > 0 &&
+		r.opts.FromTime.IsZero() && r.opts.ToTime.IsZero() {
+		r.nextIdx = m.FirstIndex
+	}
+	return nil
+}
+
+// Stats returns the reader's position and how much it had to skip.
+func (r *ArchiveReader) Stats() ArchiveReaderStats {
+	return ArchiveReaderStats{NextIndex: r.nextIdx, SkippedRecords: r.skipped}
+}
+
+// missing handles a hole covering indices from..to: an error by default, a
+// counted jump with SkipMissing.
+func (r *ArchiveReader) missing(from, to uint64, why string) error {
+	if !r.opts.SkipMissing {
+		return fmt.Errorf("%w: indices %d..%d (%s)", ErrArchiveGap, from, to, why)
+	}
+	r.skipped += to - from + 1
+	r.log.Warn("records are missing from the archive; skipping (SkipMissing)",
+		"missing_from", from, "missing_to", to, "reason", why)
+	r.nextIdx = to + 1
 	return nil
 }
 
@@ -260,7 +318,10 @@ func (r *ArchiveReader) next(ctx context.Context, block bool) ([]byte, uint64, e
 			r.finish()
 			return nil, 0, io.EOF
 		}
-		seg, ok := r.pickSegment()
+		seg, ok, err := r.pickSegment()
+		if err != nil {
+			return nil, 0, err
+		}
 		if r.chain {
 			seg, ok = ArchiveSegment{
 				Key:        archiveKey(r.opts.Prefix, r.crypto.segmentName(r.chainNext)),
@@ -272,9 +333,16 @@ func (r *ArchiveReader) next(ctx context.Context, block bool) ([]byte, uint64, e
 			err := r.openSegment(ctx, seg)
 			switch {
 			case err == nil:
+				r.gapAt = time.Time{}
 				continue
 			case r.chain && errors.Is(err, ErrObjectNotFound):
-				// The chain ends here (for now). If it never even started,
+				// Either the chain ends here, or this one object is missing
+				// and the log goes on behind it. Only the head object can
+				// tell the two apart.
+				if herr := r.chainHole(ctx); herr != nil {
+					return nil, 0, herr
+				}
+				// The end (for now). If the chain never even started,
 				// "empty archive" is the least likely explanation — say so
 				// rather than report a clean end of nothing.
 				if !r.started && !r.opts.Follow {
@@ -286,6 +354,14 @@ func (r *ArchiveReader) next(ctx context.Context, block bool) ([]byte, uint64, e
 					r.log.Warn("nothing found under this archive key yet (wrong key or prefix, or the archive is still empty); waiting",
 						"first_index", r.chainNext)
 				}
+			case errors.Is(err, ErrObjectNotFound):
+				// Listed in the manifest, absent from the store.
+				from := max(r.nextIdx, seg.FirstIndex)
+				if merr := r.missing(from, seg.LastIndex,
+					"object "+seg.Key+" is in the manifest but not in the store"); merr != nil {
+					return nil, 0, merr
+				}
+				continue
 			default:
 				return nil, 0, err
 			}
@@ -309,15 +385,45 @@ func (r *ArchiveReader) finish() {
 	r.done = true
 }
 
-// pickSegment selects the next segment to read, or ok=false if there is none
-// (yet).
-func (r *ArchiveReader) pickSegment() (ArchiveSegment, bool) {
+// chainHole is called in chain mode when the segment starting at chainNext
+// doesn't exist. It returns ErrArchiveGap if the archive's head object says
+// the log continues beyond that point; nil if this is (as far as anyone can
+// tell) the end.
+func (r *ArchiveReader) chainHole(ctx context.Context) error {
+	head, err := getArchiveHead(ctx, r.opts.Store, r.opts.Prefix, r.crypto)
+	if err == nil && !r.started && head.FirstIndex > r.chainNext {
+		// The archive (which didn't exist yet when we opened it) starts
+		// later than index 1.
+		r.chainNext = head.FirstIndex
+	}
+	if err != nil || head.LastIndex < r.chainNext {
+		r.gapAt = time.Time{}
+		return nil
+	}
+	// With parallel uploads a later segment (and the head) can land before
+	// an earlier one; a follower gives it time.
+	if r.gapAt.IsZero() {
+		r.gapAt = time.Now()
+	}
+	if r.opts.Follow && time.Since(r.gapAt) < r.opts.GapTimeout {
+		return nil
+	}
+	return fmt.Errorf("%w: the segment starting at index %d is not in the store, but the archive goes on to index %d; "+
+		"without a manifest the reader can't tell where the next segment starts, so it can't skip",
+		ErrArchiveGap, r.chainNext, head.LastIndex)
+}
+
+// pickSegment selects the next segment to read from the catalog; ok=false if
+// there is none (yet). A hole before it is an error or a counted skip,
+// depending on SkipMissing.
+func (r *ArchiveReader) pickSegment() (ArchiveSegment, bool, error) {
+	if r.chain {
+		return ArchiveSegment{}, false, nil
+	}
+	timeFilter := !r.opts.FromTime.IsZero() || !r.opts.ToTime.IsZero()
 	for _, s := range r.segs {
 		if s.LastIndex < r.nextIdx || s.LastIndex < s.FirstIndex {
 			continue
-		}
-		if r.opts.ToIndex > 0 && s.FirstIndex > r.opts.ToIndex {
-			break
 		}
 		if !r.opts.FromTime.IsZero() && s.LastRecordUnix < r.opts.FromTime.Unix() {
 			continue
@@ -326,20 +432,31 @@ func (r *ArchiveReader) pickSegment() (ArchiveSegment, bool) {
 			break
 		}
 		// s is the lowest remaining segment. Is something missing before it?
-		if r.started && s.FirstIndex > r.nextIdx {
+		// (Before the first segment that only counts if a start index was
+		// asked for explicitly.)
+		if s.FirstIndex > r.nextIdx && r.nextIdx > 0 && (r.started || !timeFilter) {
 			if r.gapAt.IsZero() {
 				r.gapAt = time.Now()
 			}
 			if r.opts.Follow && time.Since(r.gapAt) < r.opts.GapTimeout {
-				return ArchiveSegment{}, false // probably still uploading
+				// Parallel uploads can land out of order: give it time.
+				return ArchiveSegment{}, false, nil
 			}
-			r.log.Warn("archive gap: records are missing; skipping ahead",
-				"missing_from", r.nextIdx, "missing_to", s.FirstIndex-1)
+			to := s.FirstIndex - 1
+			if r.opts.ToIndex > 0 && to > r.opts.ToIndex {
+				to = r.opts.ToIndex
+			}
+			if err := r.missing(r.nextIdx, to, "no segment in the archive catalog covers them"); err != nil {
+				return ArchiveSegment{}, false, err
+			}
 		}
 		r.gapAt = time.Time{}
-		return s, true
+		if r.opts.ToIndex > 0 && s.FirstIndex > r.opts.ToIndex {
+			break
+		}
+		return s, true, nil
 	}
-	return ArchiveSegment{}, false
+	return ArchiveSegment{}, false, nil
 }
 
 // openSegment downloads seg to a temp file, verifies it against the catalog

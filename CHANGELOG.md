@@ -1,5 +1,57 @@
 # Changelog
 
+## v0.4.1 — 2026-10-12
+
+Archive integrity: a reader must never return a result with records
+silently missing.
+
+### Fixed
+
+- **A follower could skip the beginning of the log.** Uploads run in
+  parallel; when a later segment landed before the first one, a reader
+  opening the archive at that moment took it for the start and never
+  delivered the earlier records. The writer now creates the catalog —
+  declaring the index the archive starts at (`ArchiveManifest.FirstIndex`,
+  from the oldest segment on disk) — before the first segment is uploaded,
+  and the reader treats a missing beginning as a hole.
+- **Holes were skipped with only a log line.** A gap between segments in
+  the manifest made `ArchiveReader` warn and carry on. It now returns
+  `ErrArchiveGap` naming the index range, and keeps returning it. The same
+  applies to an object listed in the manifest but absent from the store, to
+  a `FromIndex` the archive doesn't have, and to a range that ends inside a
+  hole (which used to look like a clean end).
+- **Without a manifest a missing object looked like the end of the log.**
+  An encrypted archive without a manifest now carries an encrypted "head"
+  marker (first and last uploaded index); the chain reader uses it to tell
+  the two apart and to find the starting index.
+
+### Added
+
+- `ArchiveReaderOptions.SkipMissing` (opt-in jump over holes),
+  `ArchiveReader.Stats()` with `SkippedRecords`, `ErrArchiveGap`.
+- `CheckArchive` / `axwal-cli archive -check [-deep] [-dir] [-repair]`:
+  verifies that the index sequence has no holes, that every object exists
+  (with `-deep`: checksum, decryption, record CRCs and counts), and — given
+  the writer's directory — that everything marked `.archived` is really in
+  the archive; `-repair` un-marks what isn't so it is uploaded again.
+
+- **`axwal-cli readers`** — every reader of a WAL with its acknowledged
+  position, lag, measured speed and an estimate of when it catches up;
+  `-watch` to keep refreshing, `-json` for monitoring. Library:
+  `ListCursors`, `InspectLog` (read-only, register nothing).
+
+### Fixed (CLI)
+
+- `axwal-cli cursors` printed "(no cursors)" for every directory: it did
+  not understand the current cursor file format.
+
+### Changed behavior
+
+- `ArchiveReader` (and therefore `Mirror` from an archive, `dump -store`,
+  `restore -store`) stops at a hole instead of skipping it.
+- A segment is not uploaded until the manifest can be written (it used to
+  be uploaded first and the manifest retried).
+
 ## v0.4.0 — 2026-10-12
 
 Encrypted archives that can live in a public bucket. Guide (Russian):
