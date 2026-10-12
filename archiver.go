@@ -78,6 +78,12 @@ func newArchiver(w *Writer, cfg ArchiveConfig) *archiver {
 }
 
 func (a *archiver) start() {
+	// Encrypted upload temp files of a previous run that was killed mid-way.
+	if leftovers, _ := filepath.Glob(filepath.Join(a.w.dir, archiveUploadTmpPrefix+"*.tmp")); len(leftovers) > 0 {
+		for _, p := range leftovers {
+			_ = os.Remove(p)
+		}
+	}
 	a.wg.Add(1)
 	go a.loop()
 }
@@ -304,6 +310,22 @@ func (a *archiver) upload(ctx context.Context, ps pendingSeg) (key string, err e
 		SHA256: hex.EncodeToString(h256.Sum(nil)),
 	}
 
+	// With archive encryption the object is the ciphertext: encrypt into a
+	// temp file (streaming, nothing held in memory) and upload that. The
+	// salt is derived from the plaintext hash, so a retry produces the very
+	// same bytes and is recognized below as already uploaded.
+	var body io.Reader = f
+	if c := a.cfg.crypto; c != nil {
+		tmpPath := filepath.Join(a.w.dir, fmt.Sprintf("%s%d-%d.tmp", archiveUploadTmpPrefix, seg.FirstIndex, seg.LastIndex))
+		enc, encInfo, err := encryptToTemp(c, f, tmpPath, c.saltFor("segment", h256.Sum(nil)))
+		if err != nil {
+			return "", fmt.Errorf("encrypt: %w", err)
+		}
+		defer os.Remove(tmpPath)
+		defer enc.Close()
+		body, info = enc, encInfo
+	}
+
 	entry := ArchiveSegment{
 		FirstIndex:      seg.FirstIndex,
 		LastIndex:       seg.LastIndex,
@@ -326,6 +348,12 @@ func (a *archiver) upload(ctx context.Context, ps pendingSeg) (key string, err e
 		entry.KeyFingerprint = meta.KeyFingerprint
 	}
 	key = segmentObjectKey(a.cfg.Prefix, a.cfg.Layout, seg.Name, time.Unix(entry.FirstRecordUnix, 0))
+	if c := a.cfg.crypto; c != nil {
+		// The name says nothing about the content, and a reader can derive
+		// it from the key and the index it is looking for.
+		key = archiveKey(a.cfg.Prefix, c.segmentName(seg.FirstIndex))
+		entry.Encryption = archiveEncAlgo
+	}
 	entry.Key = key
 
 	// An earlier attempt may have uploaded the object and then failed on a
@@ -335,7 +363,7 @@ func (a *archiver) upload(ctx context.Context, ps pendingSeg) (key string, err e
 		return key, fmt.Errorf("stat %s: %w", key, err)
 	}
 	if !found || !objectMatches(existing, info) {
-		if err := a.cfg.Store.Put(ctx, key, f, info); err != nil {
+		if err := a.cfg.Store.Put(ctx, key, body, info); err != nil {
 			return key, fmt.Errorf("put %s: %w", key, err)
 		}
 		// Trust nothing: the mark is only written once the store itself
@@ -367,6 +395,47 @@ func (a *archiver) upload(ctx context.Context, ps pendingSeg) (key string, err e
 	return key, nil
 }
 
+// archiveUploadTmpPrefix names the temp files holding encrypted segments on
+// their way to the store. Deliberately not "wal-…": nothing that scans for
+// segments should ever look at them.
+const archiveUploadTmpPrefix = ".upload-"
+
+// encryptToTemp writes the encrypted form of src to path and returns the file
+// positioned at its start, with the size and checksums of the ciphertext.
+func encryptToTemp(c *archiveCrypto, src io.Reader, path string, salt []byte) (*os.File, ArchivePutInfo, error) {
+	out, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0600)
+	if err != nil {
+		return nil, ArchivePutInfo{}, err
+	}
+	h1, h256 := sha1.New(), sha256.New()
+	cw := &countingWriter{w: io.MultiWriter(out, h1, h256)}
+	err = c.encrypt(cw, src, salt)
+	if err == nil {
+		_, err = out.Seek(0, io.SeekStart)
+	}
+	if err != nil {
+		out.Close()
+		os.Remove(path)
+		return nil, ArchivePutInfo{}, err
+	}
+	return out, ArchivePutInfo{
+		Size:   cw.n,
+		SHA1:   hex.EncodeToString(h1.Sum(nil)),
+		SHA256: hex.EncodeToString(h256.Sum(nil)),
+	}, nil
+}
+
+type countingWriter struct {
+	w io.Writer
+	n int64
+}
+
+func (c *countingWriter) Write(p []byte) (int, error) {
+	n, err := c.w.Write(p)
+	c.n += int64(n)
+	return n, err
+}
+
 func objectMatches(o ArchiveObject, info ArchivePutInfo) bool {
 	if o.Size != info.Size {
 		return false
@@ -378,7 +447,7 @@ func (a *archiver) recordInManifest(ctx context.Context, entry ArchiveSegment) e
 	a.manMu.Lock()
 	defer a.manMu.Unlock()
 	if a.manifest == nil {
-		m, err := getManifest(ctx, a.cfg.Store, a.cfg.Prefix)
+		m, err := getManifest(ctx, a.cfg.Store, a.cfg.Prefix, a.cfg.crypto)
 		switch {
 		case err == nil:
 		case errors.Is(err, ErrObjectNotFound):
@@ -391,7 +460,7 @@ func (a *archiver) recordInManifest(ctx context.Context, entry ArchiveSegment) e
 		a.manifest = m
 	}
 	a.manifest.upsert(entry)
-	return putManifest(ctx, a.cfg.Store, a.cfg.Prefix, a.manifest)
+	return putManifest(ctx, a.cfg.Store, a.cfg.Prefix, a.manifest, a.cfg.crypto)
 }
 
 // drain waits until nothing is pending, for at most d (d <= 0: no limit).

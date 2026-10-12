@@ -7,6 +7,10 @@
 //	                        credentials: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
 //	                        (+ AWS_SESSION_TOKEN); AWS_REGION and
 //	                        AWS_ENDPOINT_URL are used when the query has none
+//	https://host/path       read-only, plain GET, no credentials: a public
+//	                        bucket or any static file server. No listing —
+//	                        for archives written with ArchiveEncryption.
+//	                        ?prefix=wal/kiosk if the URL is the bucket root.
 //	file:///abs/dir         a local directory (also a bare path);
 //	                        ?prefix=wal/kiosk for a key prefix inside it
 package storeurl
@@ -21,6 +25,7 @@ import (
 	axwal "github.com/axgrid/ax-wal"
 	"github.com/axgrid/ax-wal/store/b2store"
 	"github.com/axgrid/ax-wal/store/fsstore"
+	"github.com/axgrid/ax-wal/store/httpstore"
 	"github.com/axgrid/ax-wal/store/s3store"
 )
 
@@ -38,6 +43,15 @@ func Open(raw string) (store axwal.ArchiveStore, prefix string, err error) {
 	}
 	prefix = strings.Trim(u.Path, "/")
 	switch u.Scheme {
+	case "http", "https":
+		// The URL is the base. An archive in the clear records full object
+		// keys in its manifest, so there the base must be the bucket root
+		// with the writer's prefix passed as ?prefix=…; an encrypted archive
+		// can simply be pointed at directly.
+		prefix = strings.Trim(u.Query().Get("prefix"), "/")
+		u.RawQuery, u.Fragment = "", ""
+		return httpstore.New(u.String(), nil), prefix, nil
+
 	case "file":
 		if u.Host != "" && u.Host != "localhost" {
 			return nil, "", fmt.Errorf("storeurl: file URL must be file:///abs/path, got %q", raw)
@@ -67,7 +81,7 @@ func Open(raw string) (store axwal.ArchiveStore, prefix string, err error) {
 		}
 		return st, prefix, nil
 	}
-	return nil, "", fmt.Errorf("storeurl: unsupported scheme %q (want b2, s3 or file)", u.Scheme)
+	return nil, "", fmt.Errorf("storeurl: unsupported scheme %q (want b2, s3, https or file)", u.Scheme)
 }
 
 func firstEnv(names ...string) string {

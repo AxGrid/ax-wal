@@ -639,14 +639,27 @@ func parseWhen(flagName, v string) time.Time {
 
 // archiveFlags are the flags shared by subcommands that read from an archive.
 type archiveFlags struct {
-	store, since, until *string
+	store, since, until, archiveKey *string
+}
+
+// archiveKeyFlag is shared by every subcommand that reads an archive.
+func archiveKeyFlag(fs *flag.FlagSet) *string {
+	return fs.String("archive-key-file", "", "32-byte key file of an archive written with ArchiveEncryption (encrypted objects, hidden names)")
+}
+
+func loadArchiveKey(path string) *axwal.ArchiveEncryption {
+	if path == "" {
+		return nil
+	}
+	return &axwal.ArchiveEncryption{Key: loadKeyFile(path).Key}
 }
 
 func addArchiveFlags(fs *flag.FlagSet) archiveFlags {
 	return archiveFlags{
-		store: fs.String("store", "", "read from an ARCHIVE instead of a WAL directory: b2://bucket/prefix, s3://bucket/prefix?region=…&endpoint=…, file:///dir (credentials from the environment)"),
-		since: fs.String("since", "", "archive only: segments with records at or after this time (RFC 3339 or YYYY-MM-DD, UTC)"),
-		until: fs.String("until", "", "archive only: segments with records at or before this time"),
+		store:      fs.String("store", "", "read from an ARCHIVE instead of a WAL directory: b2://bucket/prefix, s3://bucket/prefix?region=…&endpoint=…, file:///dir (credentials from the environment), or https://… for a public bucket"),
+		archiveKey: archiveKeyFlag(fs),
+		since:      fs.String("since", "", "archive only: segments with records at or after this time (RFC 3339 or YYYY-MM-DD, UTC)"),
+		until:      fs.String("until", "", "archive only: segments with records at or before this time"),
 	}
 }
 
@@ -659,7 +672,8 @@ func (af archiveFlags) open(ctx context.Context, from, to uint64, enc *axwal.Enc
 		Store: store, Prefix: prefix,
 		FromIndex: from, ToIndex: to,
 		FromTime: parseWhen("since", *af.since), ToTime: parseWhen("until", *af.until),
-		Encryption: enc,
+		Encryption:        enc,
+		ArchiveEncryption: loadArchiveKey(*af.archiveKey),
 	})
 	if err != nil {
 		fatal("open archive: %v", err)
@@ -848,6 +862,7 @@ func cmdArchive(args []string) {
 	fs := flag.NewFlagSet("archive", flag.ExitOnError)
 	storeURL := fs.String("store", "", "archive location: b2://bucket/prefix, s3://bucket/prefix, file:///dir")
 	asJSON := fs.Bool("json", false, "print the manifest as JSON")
+	archiveKey := archiveKeyFlag(fs)
 	fs.Parse(args)
 	if *storeURL == "" {
 		fatal("archive: -store required")
@@ -858,7 +873,12 @@ func cmdArchive(args []string) {
 	}
 	ctx, cancel := signalContext()
 	defer cancel()
-	m, err := axwal.LoadArchiveManifest(ctx, store, prefix)
+	var m *axwal.ArchiveManifest
+	if enc := loadArchiveKey(*archiveKey); enc != nil {
+		m, err = axwal.LoadEncryptedArchiveManifest(ctx, store, prefix, *enc)
+	} else {
+		m, err = axwal.LoadArchiveManifest(ctx, store, prefix)
+	}
 	if err != nil {
 		fatal("load manifest: %v", err)
 	}

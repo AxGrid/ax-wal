@@ -40,8 +40,21 @@ type ArchiveReaderOptions struct {
 	// tells which key a segment needs (see KeyFingerprint).
 	Encryption *EncryptionConfig
 
+	// ArchiveEncryption must be set for an archive written with
+	// ArchiveConfig.Encryption (same key). Such an archive is read as a
+	// stream — objects are decrypted and decoded while they download,
+	// nothing is written to disk — and only ArchiveStore.Get is used, so a
+	// public bucket reached over plain HTTPS (store/httpstore) is enough.
+	//
+	// The reader normally works from the encrypted manifest. If the archive
+	// has none, it walks the chain instead: the object name of a segment
+	// follows from the key and its first index, and each segment tells
+	// where the next one starts. That walk begins at index 1 and can't
+	// filter by time.
+	ArchiveEncryption *ArchiveEncryption
+
 	// TempDir is where segments are downloaded to, one at a time. Defaults
-	// to os.TempDir().
+	// to os.TempDir(). Unused for encrypted archives.
 	TempDir string
 
 	// Follow keeps the reader alive at the end of the archive: Next blocks
@@ -75,7 +88,15 @@ type ArchiveReader struct {
 	done    bool
 	gapAt   time.Time // when the current gap was first seen
 
+	crypto *archiveCrypto
+	// chain: no manifest; segments are found by deriving the name of the
+	// one that starts at chainNext.
+	chain       bool
+	chainNext   uint64
+	warnedEmpty bool
+
 	// Currently open segment.
+	body   io.Closer // HTTP body of a streamed (encrypted) segment
 	file   *os.File
 	dec    *zstd.Decoder
 	br     *bufio.Reader
@@ -103,20 +124,36 @@ func OpenArchiveReader(ctx context.Context, opts ArchiveReaderOptions) (*Archive
 	if err != nil {
 		return nil, err
 	}
+	crypto, err := newArchiveCrypto(opts.ArchiveEncryption)
+	if err != nil {
+		return nil, err
+	}
 	r := &ArchiveReader{
 		opts:    opts,
 		log:     opts.Logger.With("component", "axwal.archive-reader", "prefix", opts.Prefix),
 		cipher:  c,
+		crypto:  crypto,
 		nextIdx: opts.FromIndex,
 	}
-	if err := r.reload(ctx); err != nil {
+	err = r.reload(ctx)
+	if crypto != nil && errors.Is(err, ErrObjectNotFound) {
+		if !opts.FromTime.IsZero() || !opts.ToTime.IsZero() {
+			return nil, errors.New("axwal: this encrypted archive has no manifest; FromTime / ToTime need one")
+		}
+		r.log.Info("encrypted archive has no manifest; walking the segment chain from index 1")
+		r.chain, r.chainNext, err = true, 1, nil
+	}
+	if err != nil {
 		return nil, err
 	}
 	return r, nil
 }
 
 func (r *ArchiveReader) reload(ctx context.Context) error {
-	m, err := LoadArchiveManifest(ctx, r.opts.Store, r.opts.Prefix)
+	if r.chain {
+		return nil
+	}
+	m, err := loadManifest(ctx, r.opts.Store, r.opts.Prefix, r.crypto)
 	if err != nil {
 		return err
 	}
@@ -183,7 +220,10 @@ func (r *ArchiveReader) next(ctx context.Context, block bool) ([]byte, uint64, e
 		if r.br != nil {
 			payload, err := readRecord(r.br)
 			if err == io.EOF {
-				if r.curIdx != r.cur.LastIndex+1 {
+				if r.chain {
+					// The segment itself told us where the next one starts.
+					r.chainNext = r.curIdx
+				} else if r.curIdx != r.cur.LastIndex+1 {
 					return nil, 0, fmt.Errorf("axwal: archive segment %s ended at index %d, expected %d",
 						r.cur.Key, r.curIdx-1, r.cur.LastIndex)
 				}
@@ -221,11 +261,34 @@ func (r *ArchiveReader) next(ctx context.Context, block bool) ([]byte, uint64, e
 			return nil, 0, io.EOF
 		}
 		seg, ok := r.pickSegment()
+		if r.chain {
+			seg, ok = ArchiveSegment{
+				Key:        archiveKey(r.opts.Prefix, r.crypto.segmentName(r.chainNext)),
+				FirstIndex: r.chainNext,
+				Encryption: archiveEncAlgo,
+			}, true
+		}
 		if ok {
-			if err := r.openSegment(ctx, seg); err != nil {
+			err := r.openSegment(ctx, seg)
+			switch {
+			case err == nil:
+				continue
+			case r.chain && errors.Is(err, ErrObjectNotFound):
+				// The chain ends here (for now). If it never even started,
+				// "empty archive" is the least likely explanation — say so
+				// rather than report a clean end of nothing.
+				if !r.started && !r.opts.Follow {
+					return nil, 0, fmt.Errorf("axwal: no manifest and no segment starting at index %d under this key: "+
+						"wrong archive key, wrong prefix, or an empty archive: %w", r.chainNext, ErrObjectNotFound)
+				}
+				if !r.started && !r.warnedEmpty {
+					r.warnedEmpty = true
+					r.log.Warn("nothing found under this archive key yet (wrong key or prefix, or the archive is still empty); waiting",
+						"first_index", r.chainNext)
+				}
+			default:
 				return nil, 0, err
 			}
-			continue
 		}
 		if !r.opts.Follow {
 			r.finish()
@@ -282,9 +345,18 @@ func (r *ArchiveReader) pickSegment() (ArchiveSegment, bool) {
 // openSegment downloads seg to a temp file, verifies it against the catalog
 // and opens it for reading.
 func (r *ArchiveReader) openSegment(ctx context.Context, seg ArchiveSegment) error {
+	if seg.Encryption != "" && r.crypto != nil {
+		// Derive the name instead of trusting the manifest's path: the
+		// reader may reach the archive under a different prefix than the
+		// writer used (a public URL that already points into it, a CDN).
+		seg.Key = archiveKey(r.opts.Prefix, r.crypto.segmentName(seg.FirstIndex))
+	}
 	rc, err := r.opts.Store.Get(ctx, seg.Key)
 	if err != nil {
 		return fmt.Errorf("get %s: %w", seg.Key, err)
+	}
+	if seg.Encryption != "" {
+		return r.openStream(rc, seg)
 	}
 	defer rc.Close()
 
@@ -333,7 +405,48 @@ func (r *ArchiveReader) openSegment(ctx context.Context, seg ArchiveSegment) err
 	return nil
 }
 
+// openStream reads an encrypted segment as it downloads: decrypt, then
+// decompress if the plaintext turns out to be zstd, then decode records.
+// Every chunk is authenticated by the cipher, so no separate checksum pass
+// (and no temp file) is needed.
+func (r *ArchiveReader) openStream(rc io.ReadCloser, seg ArchiveSegment) error {
+	if r.crypto == nil {
+		rc.Close()
+		return fmt.Errorf("%w: archive segment %s is encrypted; set ArchiveReaderOptions.ArchiveEncryption",
+			ErrEncryption, seg.Key)
+	}
+	plain := bufio.NewReaderSize(r.crypto.decryptReader(rc), 64*1024)
+	var src io.Reader = plain
+	// The manifest says whether the segment is compressed, but in chain mode
+	// there is no manifest — the zstd frame magic settles it either way.
+	if magic, err := plain.Peek(4); err == nil && magic[0] == 0x28 && magic[1] == 0xB5 && magic[2] == 0x2F && magic[3] == 0xFD {
+		dec, err := zstd.NewReader(plain)
+		if err != nil {
+			rc.Close()
+			return fmt.Errorf("zstd reader: %w", err)
+		}
+		r.dec = dec
+		src = dec
+	} else if err != nil && !errors.Is(err, io.EOF) {
+		rc.Close()
+		return fmt.Errorf("archive segment %s: %w", seg.Key, err)
+	}
+	r.body = rc
+	r.br = bufio.NewReaderSize(src, 64*1024)
+	r.cur = seg
+	r.curIdx = seg.FirstIndex
+	if !r.started || seg.FirstIndex > r.nextIdx {
+		r.nextIdx = max(r.nextIdx, seg.FirstIndex)
+	}
+	r.started = true
+	return nil
+}
+
 func (r *ArchiveReader) closeSegment() {
+	if r.body != nil {
+		_ = r.body.Close()
+		r.body = nil
+	}
 	if r.dec != nil {
 		r.dec.Close()
 		r.dec = nil

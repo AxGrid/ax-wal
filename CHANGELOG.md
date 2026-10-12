@@ -1,5 +1,30 @@
 # Changelog
 
+## v0.4.0 — 2026-10-12
+
+Encrypted archives that can live in a public bucket. Guide (Russian):
+[docs/ARCHIVE_ENCRYPTION.md](docs/ARCHIVE_ENCRYPTION.md).
+
+### Added
+
+- **`ArchiveConfig.Encryption`** (`ArchiveEncryption{Key}`): uploaded
+  segments and the manifest are sealed with AES-256-GCM in 64 KiB chunks
+  (streamable; tampering, truncation and chunk reordering are detected),
+  and object names become `HMAC-SHA256(key, first index)`, so nothing in
+  the bucket reveals contents, index ranges, record counts or order.
+  Encryption is deterministic per file, which keeps upload retries
+  idempotent. `Layout` is ignored in this mode.
+- **`ArchiveReaderOptions.ArchiveEncryption`**: reads such an archive as a
+  stream — no temp files — using only `Get`. Works from the encrypted
+  manifest, or, if there is none, by walking the chain of derived object
+  names from index 1.
+- **`store/httpstore`**: read-only `ArchiveStore` over plain HTTP(S) GET for
+  public buckets; `storeurl` accepts `https://…` URLs.
+- `LoadEncryptedArchiveManifest`, `ArchiveObjectName`,
+  `ArchiveManifestName`, `NewArchiveDecrypter`.
+- CLI: `-archive-key-file` on `axwal-cli dump / restore / archive` and
+  `axwal-mirror -store`.
+
 ## v0.3.4 — 2026-10-12
 
 Reader configuration guide (Russian): [docs/READER.md](docs/READER.md).

@@ -134,12 +134,24 @@ type ArchiveConfig struct {
 
 	// DisableManifest turns off <prefix>/manifest.json maintenance.
 	DisableManifest bool
+
+	// Encryption, if non-nil, encrypts every uploaded object and replaces
+	// object names with keyed hashes, so the bucket may be public. See
+	// ArchiveEncryption. Layout is ignored in this mode.
+	Encryption *ArchiveEncryption
+
+	crypto *archiveCrypto // derived from Encryption by withDefaults
 }
 
 func (c ArchiveConfig) withDefaults() (ArchiveConfig, error) {
 	if c.Store == nil {
 		return c, errors.New("axwal: ArchiveConfig.Store is required")
 	}
+	crypto, err := newArchiveCrypto(c.Encryption)
+	if err != nil {
+		return c, err
+	}
+	c.crypto = crypto
 	c.Prefix = strings.Trim(c.Prefix, "/")
 	if c.Concurrency <= 0 {
 		c.Concurrency = 2
@@ -191,6 +203,11 @@ type ArchiveSegment struct {
 	// empty when unencrypted or unknown.
 	KeyFingerprint string `json:"key_fingerprint,omitempty"`
 
+	// Encryption names the archive-level encryption of the object
+	// ("aes-256-gcm-stream-v1"), empty if it is stored in the clear. For an
+	// encrypted object SizeBytes / SHA1 / SHA256 describe the ciphertext.
+	Encryption string `json:"encryption,omitempty"`
+
 	UploadedAtUnix int64 `json:"uploaded_at_unix,omitempty"`
 }
 
@@ -239,13 +256,33 @@ func (m *ArchiveManifest) upsert(seg ArchiveSegment) {
 // or segments uploaded by something else), the catalog is rebuilt by listing
 // the prefix and parsing segment names; record times then fall back to object
 // modification times and checksums / key fingerprints are empty.
+//
+// For an archive written with ArchiveConfig.Encryption use
+// LoadEncryptedArchiveManifest.
 func LoadArchiveManifest(ctx context.Context, store ArchiveStore, prefix string) (*ArchiveManifest, error) {
+	return loadManifest(ctx, store, prefix, nil)
+}
+
+// LoadEncryptedArchiveManifest returns the catalog of an archive written
+// with ArchiveConfig.Encryption. Only Get is used, so it works on a public
+// bucket that can't be listed. Returns ErrObjectNotFound if the archive has
+// no manifest (an encrypted archive can't be reconstructed from a listing:
+// its object names don't say what they hold).
+func LoadEncryptedArchiveManifest(ctx context.Context, store ArchiveStore, prefix string, enc ArchiveEncryption) (*ArchiveManifest, error) {
+	crypto, err := newArchiveCrypto(&enc)
+	if err != nil {
+		return nil, err
+	}
+	return loadManifest(ctx, store, prefix, crypto)
+}
+
+func loadManifest(ctx context.Context, store ArchiveStore, prefix string, crypto *archiveCrypto) (*ArchiveManifest, error) {
 	prefix = strings.Trim(prefix, "/")
-	m, err := getManifest(ctx, store, prefix)
+	m, err := getManifest(ctx, store, prefix, crypto)
 	if err == nil {
 		return m, nil
 	}
-	if !errors.Is(err, ErrObjectNotFound) {
+	if !errors.Is(err, ErrObjectNotFound) || crypto != nil {
 		return nil, err
 	}
 
@@ -255,7 +292,8 @@ func LoadArchiveManifest(ctx context.Context, store ArchiveStore, prefix string)
 	}
 	objs, err := store.List(ctx, listPrefix)
 	if err != nil {
-		return nil, fmt.Errorf("list archive: %w", err)
+		return nil, fmt.Errorf("no %s under %q and the store can't be listed "+
+			"(if this archive is encrypted, the archive key is required): %w", archiveManifestName, prefix, err)
 	}
 	m = &ArchiveManifest{Version: 1}
 	for _, o := range objs {
@@ -280,13 +318,21 @@ func LoadArchiveManifest(ctx context.Context, store ArchiveStore, prefix string)
 
 // getManifest fetches and parses the manifest object; ErrObjectNotFound if
 // there is none.
-func getManifest(ctx context.Context, store ArchiveStore, prefix string) (*ArchiveManifest, error) {
-	rc, err := store.Get(ctx, archiveKey(prefix, archiveManifestName))
+func getManifest(ctx context.Context, store ArchiveStore, prefix string, crypto *archiveCrypto) (*ArchiveManifest, error) {
+	name := archiveManifestName
+	if crypto != nil {
+		name = crypto.manifestName()
+	}
+	rc, err := store.Get(ctx, archiveKey(prefix, name))
 	if err != nil {
 		return nil, err
 	}
 	defer rc.Close()
-	body, err := io.ReadAll(rc)
+	var src io.Reader = rc
+	if crypto != nil {
+		src = crypto.decryptReader(rc)
+	}
+	body, err := io.ReadAll(src)
 	if err != nil {
 		return nil, fmt.Errorf("read manifest: %w", err)
 	}
@@ -297,16 +343,25 @@ func getManifest(ctx context.Context, store ArchiveStore, prefix string) (*Archi
 	return &m, nil
 }
 
-func putManifest(ctx context.Context, store ArchiveStore, prefix string, m *ArchiveManifest) error {
+func putManifest(ctx context.Context, store ArchiveStore, prefix string, m *ArchiveManifest, crypto *archiveCrypto) error {
 	m.Version = 1
 	m.UpdatedAtUnix = time.Now().Unix()
 	body, err := json.MarshalIndent(m, "", " ")
 	if err != nil {
 		return err
 	}
+	name := archiveManifestName
+	if crypto != nil {
+		plainSum := sha256.Sum256(body)
+		var enc bytes.Buffer
+		if err := crypto.encrypt(&enc, bytes.NewReader(body), crypto.saltFor("manifest", plainSum[:])); err != nil {
+			return err
+		}
+		body, name = enc.Bytes(), crypto.manifestName()
+	}
 	s1 := sha1.Sum(body)
 	s256 := sha256.Sum256(body)
-	return store.Put(ctx, archiveKey(prefix, archiveManifestName), bytes.NewReader(body), ArchivePutInfo{
+	return store.Put(ctx, archiveKey(prefix, name), bytes.NewReader(body), ArchivePutInfo{
 		Size:   int64(len(body)),
 		SHA1:   hex.EncodeToString(s1[:]),
 		SHA256: hex.EncodeToString(s256[:]),

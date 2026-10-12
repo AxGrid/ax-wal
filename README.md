@@ -336,6 +336,7 @@ Stores:
 | `store/b2store` | Backblaze B2 native API — `b2store.New(keyID, appKey, bucket)` |
 | `store/s3store` | S3 and compatibles (AWS, MinIO, R2, B2's S3 endpoint), SigV4 — `s3store.New(s3store.Config{…})` |
 | `store/fsstore` | a local / mounted directory — `fsstore.New(dir)` |
+| `store/httpstore` | read-only, plain HTTP(S) GET without credentials — a public bucket or static file server — `httpstore.New(baseURL, nil)` |
 | `store/storeurl` | opens any of the above from `b2://bucket/prefix`, `s3://bucket/prefix?region=…&endpoint=…`, `file:///dir`, with credentials from the environment (used by the CLIs) |
 
 None of them pulls in an SDK. To plug in your own, implement three methods:
@@ -365,6 +366,41 @@ axwal-cli archive -store b2://bucket/wal/kiosk-prod -json    # the manifest
 
 The same record times and key fingerprint are in the local `wal-F-L.meta`
 sidecar.
+
+#### Encrypted archive in a public bucket
+
+```go
+Archive: &axwal.ArchiveConfig{
+    Store:      b2store.New(keyID, appKey, bucket),
+    Prefix:     "wal/kiosk-prod",
+    Encryption: &axwal.ArchiveEncryption{Key: archiveKey}, // 32 bytes
+},
+```
+
+Every object is sealed with AES-256-GCM (64 KiB chunks, decryptable as a
+stream) and stored under `HMAC(key, first index)` instead of
+`wal-F-L.zst`; the manifest is encrypted and named the same way. Without
+the key the bucket holds opaque blobs with random-looking names — no
+contents, index ranges, record counts or ordering — so it can be made
+public and read over plain HTTPS with no credentials:
+
+```go
+r, _ := axwal.OpenArchiveReader(ctx, axwal.ArchiveReaderOptions{
+    Store:             httpstore.New("https://f004.backblazeb2.com/file/my-bucket/wal/kiosk-prod", nil),
+    ArchiveEncryption: &axwal.ArchiveEncryption{Key: archiveKey},
+})
+```
+
+```bash
+axwal-cli dump -store https://f004.backblazeb2.com/file/my-bucket/wal/kiosk-prod \
+    -archive-key-file archive.key -raw
+```
+
+The reader streams — it decrypts, decompresses and decodes while
+downloading, nothing touches the disk — and never lists the bucket: object
+names follow from the key and the index it wants. Details, the on-wire
+format and what an observer can still see (in Russian):
+[docs/ARCHIVE_ENCRYPTION.md](docs/ARCHIVE_ENCRYPTION.md).
 
 #### Reading from the archive
 

@@ -66,6 +66,7 @@ func main() {
 	// Archive source flags.
 	storeURL := flag.String("store", "", "ARCHIVE source: b2://bucket/prefix, s3://bucket/prefix?region=…&endpoint=…, file:///dir (credentials from the environment)")
 	poll := flag.Duration("poll", 30*time.Second, "ARCHIVE: how often to look for newly uploaded segments")
+	archiveKey := flag.String("archive-key-file", "", "ARCHIVE: 32-byte key file of an archive written with ArchiveEncryption")
 
 	srcKey := flag.String("src-key-file", "", "32B AES key for an encrypted local or archive source")
 	dstKey := flag.String("dst-key-file", "", "32B AES key for encrypted destination")
@@ -130,6 +131,9 @@ func main() {
 			FromIndex:    opts.StartAtIndex, // -from <index>; resumes from <dst>/archive-mirror.pos afterwards
 			PollInterval: *poll,
 			Encryption:   loadKeyFile(*srcKey),
+		}
+		if k := loadKeyFile(*archiveKey); k != nil {
+			opts.SrcArchive.ArchiveEncryption = &axwal.ArchiveEncryption{Key: k.Key}
 		}
 	} else if *src != "" {
 		opts.SrcDir = *src
